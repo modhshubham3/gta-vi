@@ -1,0 +1,5 @@
+streamlink>=8.0
+faster-whisper>=1.1
+numpy
+chat-downloader>=0.2.8
+requests
