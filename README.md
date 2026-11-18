@@ -98,3 +98,5 @@ Clips are encoded at most 8 Mbit/s (about 31 MB for 30 s). A clip over 48 MB is 
 ## Friends (receive clips, no control)
 
 The owner (the chat in `CHAT_ID`) can run `/addfriend CHATID`. A friend first sends `/start` and `/id` to the bot to learn their chat id. Friends then receive every clip and the "LIVE now" notices, and may use `/status`, `/clips` and `/disk`. Everything else (`/watch`, `/waitfor`, `/stop`, `/set`, `/update`, `/clean`, `/addfriend`...) stays owner-only. `/friends` lists them and `/removefriend CHATID` removes one.
+
+`/addadmin CHATID` gives a trusted person every command except adding or removing people (`/addfriend`, `/addadmin`, `/removefriend`, `/removeadmin`, `/friends` stay owner-only, so an admin can neither lock the owner out nor add others). `/removeadmin CHATID` demotes them to a friend. `/update` can only pull from the repo and branch configured on the laptop, and `/set` values are validated, so chat commands cannot run arbitrary code or read `bot.env`.

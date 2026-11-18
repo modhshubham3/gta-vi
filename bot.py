@@ -126,6 +126,7 @@ def load_state():
     s.setdefault('desired', False)
     s.setdefault('channel', None)
     s.setdefault('viewers', [])
+    s.setdefault('admins', [])
     return s
 
 
@@ -375,7 +376,8 @@ HELP = '''/watch LINK   start (YouTube live link or Twitch channel name/link)
 /restart   restart with the current settings
 /update   download the latest code from GitHub and restart
 /rollback   undo the last /update
-/addfriend CHATID   let a friend receive clips (they send /id to the bot first)
+/addfriend CHATID   let a friend receive clips and see status (they send /start and /id first)
+/addadmin CHATID   same, plus every command except adding or removing people
 /removefriend CHATID   remove a friend
 /friends   list friends
 /id   show your chat id'''
@@ -389,15 +391,18 @@ FRIEND_HELP = '''You can receive the clips here and use:
 Only the owner can start, stop or change things.'''
 
 
-def handle(m, tg, text, owner=True):
+OWNER_ONLY = ('/addfriend', '/removefriend', '/addadmin', '/removeadmin', '/friends')
+
+
+def handle(m, tg, text, role='owner'):
     parts = text.strip().split()
     cmd = parts[0].lower().split('@')[0]
     args = parts[1:]
     s = m.state
-    if not owner and cmd not in FRIEND_CMDS:
+    if (role == 'friend' and cmd not in FRIEND_CMDS) or (role != 'owner' and cmd in OWNER_ONLY):
         return tg.send('Only the owner can do that.')
     if cmd in ('/start', '/help'):
-        tg.send(HELP if owner else FRIEND_HELP)
+        tg.send(FRIEND_HELP if role == 'friend' else HELP)
     elif cmd == '/addfriend':
         if len(args) != 1 or not re.fullmatch(r'-?\d{5,15}', args[0]):
             return tg.send('Usage: /addfriend CHATID (your friend sends /id to this bot to get it, and must send /start first)')
@@ -407,13 +412,28 @@ def handle(m, tg, text, owner=True):
         tg.viewers = list(s['viewers'])
         tg.send(f'Added {args[0]}. They now get every clip and can use /status, /clips, /disk.')
         tg.send('You were added to receive clips. Send /help to see what you can do.', chat_id=args[0])
+    elif cmd == '/addadmin':
+        if len(args) != 1 or not re.fullmatch(r'-?\d{5,15}', args[0]):
+            return tg.send('Usage: /addadmin CHATID (they send /start and /id to this bot first)')
+        for lst in ('viewers', 'admins'):
+            if args[0] not in s[lst]:
+                s[lst].append(args[0])
+        save_state(s)
+        tg.viewers = list(s['viewers'])
+        tg.send(f'Added {args[0]} as admin: gets every clip and can use every command except adding or removing people.')
+        tg.send('You are now an admin of this bot. Send /help to see the commands.', chat_id=args[0])
+    elif cmd == '/removeadmin':
+        s['admins'] = [v for v in s['admins'] if v not in args]
+        save_state(s)
+        tg.send('Admin rights removed (they still receive clips as a friend). /removefriend removes them completely.')
     elif cmd == '/removefriend':
         s['viewers'] = [v for v in s['viewers'] if v not in args]
+        s['admins'] = [v for v in s['admins'] if v not in args]
         save_state(s)
         tg.viewers = list(s['viewers'])
         tg.send('Removed.')
     elif cmd == '/friends':
-        tg.send('Friends: ' + (', '.join(s['viewers']) or 'none'))
+        tg.send('Friends: ' + (', '.join(v + (' (admin)' if v in s['admins'] else '') for v in s['viewers']) or 'none'))
     elif cmd == '/watch':
         if not args:
             return tg.send('Usage: /watch LINK')
@@ -687,7 +707,8 @@ def loop(tg, m, chat, offset):
                     tg.send(f'Error: {type(e).__name__}')
             elif cid in [str(v) for v in m.state['viewers']]:
                 try:
-                    handle(m, Replier(tg, cid), text, owner=False)
+                    role = 'admin' if cid in [str(a) for a in m.state['admins']] else 'friend'
+                    handle(m, Replier(tg, cid), text, role)
                 except Exception as e:  # noqa: BLE001
                     tg.send(f'Error: {type(e).__name__}', chat_id=cid)
             # anyone else is ignored
