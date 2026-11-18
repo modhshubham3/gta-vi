@@ -111,3 +111,7 @@ If `yt_token.json` exists, each clip also carries a **⬆ YouTube (Private)** bu
 3. On the laptop: `python yt_auth.py`, sign in with the channel account, allow "upload videos".
 
 Limits you cannot code around: uploads from unaudited API projects are forced to **Private** (you make them public in Studio), and one upload costs about 1,600 of the 10,000 daily quota units (the chat polling uses the same quota), so the bot allows 5 uploads a day. `client_secret.json` and `yt_token.json` are secrets and are git-ignored.
+
+## Manual clip: /clipnow
+
+On a very busy chat the API-based counter saturates (the message count stays flat, so no spike is ever seen). `/clipnow [seconds]` (owner and admins) cuts the last 25 s (10 to 60) of the recording that is being written right now, with captions, and the normal sender delivers it. Watch the stream yourself and send it when something happens.

@@ -399,6 +399,7 @@ HELP = '''/watch LINK   start (YouTube live link or Twitch channel name/link)
 Tap the ⬆ button under a clip to upload it to YouTube as Private (owner and admins)
 /settings   show settings
 /set NAME VALUE   change a setting, then /restart
+/clipnow [seconds]   cut the last 25 s (or that many) of what is being recorded right now
 /restart   restart with the current settings
 /update   download the latest code from GitHub and restart
 /rollback   undo the last /update
@@ -488,6 +489,9 @@ def handle(m, tg, text, role='owner'):
     elif cmd == '/stop':
         m.stop()
         tg.send('Stopped.')
+    elif cmd == '/clipnow':
+        back = min(max(int(args[0]), 10), 60) if args and args[0].isdigit() else 25
+        threading.Thread(target=clip_now, args=(tg, m, back), daemon=True).start()
     elif cmd == '/restart':
         tg.send('Restarting.' if m.start() else 'Nothing to restart. Use /watch LINK first.')
     elif cmd == '/status':
@@ -717,6 +721,33 @@ def send_clip(tg, path):
         tg.send_all(f'YOUTUBE TITLE:\n{cap["title"]}\n\nDESCRIPTION:\n{cap["description"]}\n\nINSTAGRAM CAPTION:\n{cap["ig"]}')
     except Exception as e:  # noqa: BLE001
         tg.send_all(f'(could not write a caption: {type(e).__name__})')
+
+
+def latest_recording():
+    recs = recordings()
+    return recs[-1] if recs else None
+
+
+def clip_now(tg, m, back):
+    """Cut the last `back` seconds of the recording that is being written right now, and let the normal sender deliver it."""
+    time.sleep(6)  # let the recording catch up a little
+    rec = latest_recording()
+    if rec is None:
+        return tg.send('No recording yet. Start one with /watch.')
+    try:
+        dur = float(subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', str(rec)],
+                                   capture_output=True, text=True, check=True).stdout.strip())
+    except Exception:  # noqa: BLE001
+        return tg.send('Could not read the recording yet. Try again in a few seconds.')
+    s = m.state['settings']
+    cmd = [sys.executable, WATCHER, '--file', str(rec), '--at', str(int(dur)), '--before', str(back), '--window', '0',
+           '--length', str(back + 5), '--model', str(s['model']), '--out', str(OUT)]
+    if not s['captions']:
+        cmd.append('--no-captions')
+    tg.send(f'Cutting the last {back} s. It arrives in a minute or two.')
+    p = subprocess.run(cmd, capture_output=True, text=True, cwd=HERE)
+    if p.returncode != 0:
+        tg.send('Cutting failed: ' + (p.stderr or p.stdout)[-200:])
 
 
 def code_version():
