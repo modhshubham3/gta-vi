@@ -44,11 +44,11 @@ BACKUP = HERE / 'backup'
 TG_LIMIT = 48 * 1024 * 1024  # Telegram bots can upload up to 50 MB
 
 DEFAULTS = {'ratio': 2.5, 'min_msgs': 20, 'window': 10.0, 'quality': '720p60', 'model': 'tiny',
-            'api_poll': 10.0, 'gap': 60.0, 'length': 30.0, 'before': 15.0, 'captions': True, 'verbose': True, 'topic': 'GTA_6', 'crop': False}
+            'api_poll': 10.0, 'gap': 60.0, 'length': 30.0, 'before': 15.0, 'captions': True, 'verbose': True, 'topic': 'GTA_6', 'crop': False, 'audio': True, 'audio_db': 7.0}
 KINDS = {'ratio': float, 'min_msgs': int, 'window': float, 'quality': str, 'model': str,
-         'api_poll': float, 'gap': float, 'length': float, 'before': float, 'captions': bool, 'verbose': bool, 'topic': str, 'crop': bool}
+         'api_poll': float, 'gap': float, 'length': float, 'before': float, 'captions': bool, 'verbose': bool, 'topic': str, 'crop': bool, 'audio': bool, 'audio_db': float}
 FLAGS = {'ratio': '--ratio', 'min_msgs': '--min-msgs', 'window': '--window', 'quality': '--quality',
-         'model': '--model', 'api_poll': '--api-poll', 'gap': '--gap', 'length': '--length', 'before': '--before'}
+         'model': '--model', 'api_poll': '--api-poll', 'gap': '--gap', 'length': '--length', 'before': '--before', 'audio_db': '--audio-db'}
 
 
 def log(msg):
@@ -210,6 +210,8 @@ def build_cmd(url, s):
         cmd.append('--verbose')
     if s.get('crop'):  # fill the whole vertical frame instead of a small band over a blurred background
         cmd.append('--crop')
+    if not s.get('audio', True):
+        cmd.append('--no-audio')
     return cmd
 
 
@@ -422,7 +424,7 @@ HELP = '''/watch LINK   start (YouTube live link or Twitch channel name/link)
 /clean   delete finished recordings to free space\n/clearclips [hours]   delete old clips (default: older than 1 hour)
 Tap the ⬆ button under a clip to upload it to YouTube as Private (owner and admins)
 /settings   show settings
-/set NAME VALUE   change a setting, then /restart
+/set NAME VALUE   change a setting (audio_db = how loud a moment must be; audio off = chat only)
 /clipnow [seconds]   cut the last 25 s (or that many) of what is being recorded right now
 /permission yes|no   say whether the streamer allowed clips (default no)
 /restart   restart with the current settings
@@ -601,8 +603,9 @@ def read_transcript(path):
         lines = srt.read_text(encoding='utf-8').splitlines()
     except OSError:
         return ''
-    words = [l.strip() for l in lines if l.strip() and not l.strip().isdigit() and '-->' not in l]
-    return ' '.join(words)
+    words = [l.strip() for l in lines if l.strip() and not l.strip().isdigit() and '-->' not in l
+             and not l.strip().startswith('{\\')]  # the on-screen credit cue is not speech
+    return re.sub(r'\{[^}]*\}', '', ' '.join(words)).strip()
 
 
 def clean_text(text):
@@ -723,12 +726,14 @@ def clip_quality(path):
 
 
 def spike_ratio(path):
-    """How big the chat spike was behind this clip (from clips/spikes.csv), or None for a manual /clipnow clip."""
+    """What triggered this clip, from clips/spikes.csv: ('chat', ratio), ('audio', dB above normal), or None for a /clipnow clip."""
     try:
         for line in (CLIPS / 'spikes.csv').read_text(encoding='utf-8').splitlines():
             parts = line.split(',')
             if len(parts) >= 4 and parts[3].strip() == path.name:
-                return int(parts[1]) / max(float(parts[2]), 1.0)
+                if len(parts) >= 6 and parts[4].strip() == 'audio':
+                    return ('audio', float(parts[5]))
+                return ('chat', int(parts[1]) / max(float(parts[2]), 1.0))
     except Exception:  # noqa: BLE001
         pass
     return None
@@ -737,13 +742,13 @@ def spike_ratio(path):
 def score_clip(path, info, cap):
     """1-10 and a plain-words verdict, so you can decide in two seconds."""
     sc, why = 5, []
-    ratio = spike_ratio(path)
-    if ratio is not None:
-        if ratio >= 3:
-            sc += 2
-        elif ratio >= 2:
-            sc += 1
-        why.append(f'chat spike {ratio:.1f}x')
+    trig = spike_ratio(path)
+    if trig and trig[0] == 'audio':
+        sc += 2 if trig[1] >= 12 else 1
+        why.append(f'loud moment +{trig[1]:.0f} dB')
+    elif trig:
+        sc += 2 if trig[1] >= 3 else (1 if trig[1] >= 2 else 0)
+        why.append(f'chat spike {trig[1]:.1f}x')
     else:
         sc += 1
         why.append('picked by you')

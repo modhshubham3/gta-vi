@@ -239,6 +239,49 @@ class Recorder(threading.Thread):
             self.path, self.started = None, None
 
 
+class AudioWatcher(threading.Thread):
+    """Finds loud moments (screams, laughs, explosions) in the recording itself. Needs no chat, no API, no quota,
+    so it works on huge streams where the chat counter is blind. Every few seconds it measures the loudness of the
+    last few seconds of the recording; a jump of `db` dB above the recent normal is a moment."""
+
+    def __init__(self, get_path, stop, on_spike, db=7.0, interval=5.0, probe=6, min_samples=12, verbose=False):
+        super().__init__(daemon=True)
+        self.get_path, self.stop, self.on_spike = get_path, stop, on_spike
+        self.db, self.interval, self.probe, self.min_samples, self.verbose = db, interval, probe, min_samples, verbose
+        self.levels = deque(maxlen=48)  # about four minutes of history at 5 s steps
+
+    def measure(self, path):
+        """Mean loudness (dB) of the last `probe` seconds, or None."""
+        try:
+            p = subprocess.run(['ffmpeg', '-hide_banner', '-nostats', '-sseof', f'-{self.probe}', '-i', str(path), '-vn',
+                                '-af', 'volumedetect', '-f', 'null', '-'], capture_output=True, text=True, timeout=30)
+            m = re.search(r'mean_volume:\s*(-?[\d.]+) dB', p.stderr)
+            return float(m.group(1)) if m else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def run(self):
+        n = 0
+        while not self.stop.is_set():
+            self.stop.wait(self.interval)
+            path = self.get_path()
+            if not path or not Path(path).exists():
+                self.levels.clear()
+                continue
+            lvl = self.measure(path)
+            if lvl is None or lvl < -60:  # silence or unreadable
+                continue
+            base = statistics.median(self.levels) if len(self.levels) >= self.min_samples else None
+            n += 1
+            if self.verbose and n % 6 == 0:
+                log(f'audio {lvl:.1f} dB (normal {base:.1f} dB)' if base is not None else f'audio {lvl:.1f} dB (learning)')
+            if base is not None and lvl - base >= self.db and lvl > -40:
+                self.on_spike(lvl - base, lvl)
+                self.levels.clear()  # the loud moment must not become the new normal
+                continue
+            self.levels.append(lvl)
+
+
 # ---------- Clip making: FFmpeg cut, Whisper captions, vertical render ----------
 _model = None
 DEVICE = 'auto'  # auto: try the GPU, fall back to the CPU
@@ -273,8 +316,13 @@ def write_captions(media, srt, model_name, words_per_cue=3):
                          check=True, capture_output=True).stdout
     audio = np.frombuffer(pcm, np.int16).astype(np.float32) / 32768.0
     def run(model):
-        segments, _ = model.transcribe(audio, word_timestamps=True, vad_filter=True, condition_on_previous_text=False)
-        return [w for s in segments for w in (s.words or [])]
+        segments, info = model.transcribe(audio, word_timestamps=True, vad_filter=True, condition_on_previous_text=False)
+        ws = [w for s in segments for w in (s.words or [])]
+        # Whisper-tiny turns Hindi/Hinglish speech into nonsense English. Better no captions than wrong ones.
+        if info.language != 'en' or info.language_probability < 0.6:
+            log(f'captions: speech is {info.language} ({info.language_probability:.0%}), not English: skipping spoken captions')
+            return []
+        return ws
     try:
         words = run(whisper_model(model_name))
     except RuntimeError as e:  # a GPU without the CUDA libraries fails here, not when loading
@@ -376,11 +424,11 @@ def watch(args):
     new_log = not log_file.exists()
     with open(log_file, 'a', newline='') as f:
         if new_log:
-            csv.writer(f).writerow(['time', 'messages_in_window', 'normal', 'clip'])
+            csv.writer(f).writerow(['time', 'messages_in_window', 'normal', 'clip', 'kind', 'strength'])
 
     def cutter():
         while True:
-            path, start, end, name, msgs, base = jobs.get()
+            path, start, end, name, msgs, base, kind = jobs.get()
             while rec.path == path and (rec.offset() or 0) < end + 3:  # wait until the recording has the whole clip
                 time.sleep(1)
             out = clips / f'{name}.mp4'
@@ -388,17 +436,39 @@ def watch(args):
                 words = make_clip(path, start, end - start, out, args.model, not args.no_captions, args.crop)
                 log(f'clip: {out.name} ({words} caption words)')
                 with open(log_file, 'a', newline='') as f:
-                    csv.writer(f).writerow([time.strftime('%Y-%m-%d %H:%M:%S'), msgs, f'{base:.1f}', out.name])
+                    csv.writer(f).writerow([time.strftime('%Y-%m-%d %H:%M:%S'), msgs, f'{base:.1f}', out.name, kind, f'{base:.1f}' if kind == 'audio' else ''])
             except Exception as e:  # noqa: BLE001 - one bad clip must never stop the watcher
                 log(f'clip failed: {e}')
 
     threading.Thread(target=cutter, daemon=True).start()
 
     history = deque(maxlen=max(6, int(args.baseline / args.window)))
-    last_clip = -1e9
+    state = {'last': -1e9}
+    gate = threading.Lock()
+
+    def trigger(kind, back, label, n, base):
+        """One place decides whether a moment becomes a clip: respects --gap and does not let the render queue pile up."""
+        off = rec.offset()
+        if off is None or rec.path is None:
+            return
+        with gate:
+            if off - state['last'] < args.gap:
+                return
+            if jobs.qsize() >= 3:
+                log(f'moment skipped ({label}): {jobs.qsize()} clips are already waiting to render')
+                return
+            state['last'] = off
+        start = max(0, off - back)
+        name = f'{args.channel}_{time.strftime("%H%M%S")}'
+        log(f'{kind} moment: {label}; cutting {args.length:g} s')
+        jobs.put((rec.path, start, start + args.length, name, n, base, kind))
+
+    if args.audio:
+        AudioWatcher(lambda: rec.path, stop, lambda delta, lvl: trigger('audio', 6 + args.audio_before, f'loudness +{delta:.0f} dB', 'audio', delta),
+                     db=args.audio_db, verbose=args.verbose).start()
     next_tick = time.monotonic() + args.window
-    log(f'watching #{args.channel}: a spike is {args.ratio}x the normal {args.window:g}-second count '
-        f'(at least {args.min_msgs} messages). Ctrl+C stops.')
+    log(f'watching #{args.channel}: a chat spike is {args.ratio}x the normal {args.window:g}-second count '
+        f'(at least {args.min_msgs} messages)' + (f'; a loud moment is +{args.audio_db:g} dB' if args.audio else '') + '. Ctrl+C stops.')
     try:
         while True:
             time.sleep(max(0, next_tick - time.monotonic()))
@@ -415,16 +485,8 @@ def watch(args):
                 log(f'{n} messages in the last {args.window:g} s (normal {normal})')
             if normal is None or n < max(args.min_msgs, args.ratio * max(normal, 1)):
                 continue
-            off = rec.offset()
-            if off - last_clip < args.gap:
-                continue
-            last_clip = off
             # Chat reacts a few seconds after the moment, so most of the clip comes before the spike.
-            start = max(0, off - args.window - args.before)
-            end = start + args.length
-            name = f'{args.channel}_{time.strftime("%H%M%S")}'
-            log(f'spike: {n} messages vs a normal {normal:g}; cutting {args.length:g} s')
-            jobs.put((rec.path, start, end, name, n, normal))
+            trigger('chat', args.window + args.before, f'{n} messages vs a normal {normal:g}', n, normal)
     except KeyboardInterrupt:
         log('stopping')
         stop.set()
@@ -446,6 +508,9 @@ def main():
     p.add_argument('--gap', type=float, default=60, help='at least this many seconds between clips (default: 60)')
     p.add_argument('--model', default='base', help='Whisper model: tiny, base, small, medium (default: base)')
     p.add_argument('--device', default='auto', choices=['auto', 'cpu', 'cuda'], help='where Whisper runs (default: auto)')
+    p.add_argument('--no-audio', dest='audio', action='store_false', help='do not look for loud moments in the recording')
+    p.add_argument('--audio-db', type=float, default=7.0, help='a loud moment is this many dB above the recent normal (default: 7)')
+    p.add_argument('--audio-before', type=float, default=10.0, help='seconds kept before a loud moment (default: 10)')
     p.add_argument('--no-captions', action='store_true', help='skip Whisper captions')
     p.add_argument('--crop', action='store_true', help='centre-crop to 9:16 instead of a blurred fill')
     p.add_argument('--verbose', action='store_true', help='print every chat count')
