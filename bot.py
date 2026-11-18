@@ -72,10 +72,16 @@ class Telegram:
         self.url, self.chat_id, self.http = f'{base}/bot{token}/', chat_id, requests.Session()
         self.viewers = []
 
-    def call(self, method, http_timeout=40, files=None, **params):
+    def call(self, method, http_timeout=40, files=None, _retry=True, **params):
         try:
             r = self.http.post(self.url + method, data=params, files=files, timeout=http_timeout)
             j = r.json()
+            wait = (j.get('parameters') or {}).get('retry_after') if not j.get('ok') else None
+            if wait and _retry:  # Telegram says "too many requests": wait as told and try once more
+                time.sleep(min(int(wait), 30) + 1)
+                for f in (files or {}).values():
+                    f.seek(0)
+                return self.call(method, http_timeout, files, _retry=False, **params)
             return j.get('result') if j.get('ok') else None
         except Exception as e:  # noqa: BLE001 - print only the type: the message holds the URL with the token
             log(f'telegram {method} failed: {type(e).__name__}')
@@ -87,19 +93,23 @@ class Telegram:
             self.call('sendMessage', chat_id=chat_id or self.chat_id, text=text[i:i + 4000], **extra)
 
     def send_video(self, path, caption='', only=None, markup=None):
-        """Send a clip to the owner and every friend (or just `only`). It is uploaded once; the others get it by file_id."""
+        """Send a clip to the owner and every friend (or just `only`). Uploaded once; the others get it by file_id.
+        Returns True if the first recipient really got it."""
         targets = [only] if only else [self.chat_id] + list(self.viewers)
-        file_id = None
+        file_id, first_ok = None, False
         extra = {'reply_markup': markup} if markup else {}
-        for t in targets:
+        for i, t in enumerate(targets):
             if file_id:
-                self.call('sendVideo', chat_id=t, video=file_id, caption=caption[:900], **extra)
-                continue
-            with open(path, 'rb') as f:
-                r = self.call('sendVideo', http_timeout=300, files={'video': f}, chat_id=t,
-                              caption=caption[:900], supports_streaming='true', width=1080, height=1920, **extra)
-            if isinstance(r, dict):
-                file_id = (r.get('video') or {}).get('file_id')
+                r = self.call('sendVideo', chat_id=t, video=file_id, caption=caption[:900], **extra)
+            else:
+                with open(path, 'rb') as f:
+                    r = self.call('sendVideo', http_timeout=300, files={'video': f}, chat_id=t,
+                                  caption=caption[:900], supports_streaming='true', width=1080, height=1920, **extra)
+                if isinstance(r, dict):
+                    file_id = (r.get('video') or {}).get('file_id')
+            if i == 0:
+                first_ok = bool(r)
+        return first_ok
 
     def send_all(self, text, only=None, html=False):
         for t in ([only] if only else [self.chat_id] + list(self.viewers)):
@@ -143,6 +153,7 @@ def load_state():
     s.setdefault('uploaded', {})
     s.setdefault('uploads', {'day': '', 'n': 0})
     s.setdefault('credit', None)
+    s.setdefault('permission', False)
     return s
 
 
@@ -237,6 +248,15 @@ def kill_leftover(state):
 
 
 # ---------- Running clip_watcher ----------
+def write_credit_file(author):
+    try:
+        OUT.mkdir(parents=True, exist_ok=True)
+        f = OUT / 'credit.txt'
+        f.write_text(author, encoding='utf-8') if author else f.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 class Manager:
     def __init__(self, tg, state):
         self.tg, self.state = tg, state
@@ -274,6 +294,7 @@ class Manager:
         info = probe_live(url) or {}
         if info.get('author') or not c:
             self.state['credit'] = {'author': info.get('author', ''), 'url': url}
+            write_credit_file(info.get('author', ''))
 
     def stop_process(self):
         p = self.proc
@@ -403,6 +424,7 @@ Tap the ⬆ button under a clip to upload it to YouTube as Private (owner and ad
 /settings   show settings
 /set NAME VALUE   change a setting, then /restart
 /clipnow [seconds]   cut the last 25 s (or that many) of what is being recorded right now
+/permission yes|no   say whether the streamer allowed clips (default no)
 /restart   restart with the current settings
 /update   download the latest code from GitHub and restart
 /rollback   undo the last /update
@@ -441,6 +463,10 @@ def handle(m, tg, text, role='owner'):
         yt_auth_start(tg)
     elif cmd == '/ytcode':
         yt_auth_finish(tg, args[0] if args else '')
+    elif cmd == '/permission':
+        s['permission'] = bool(args) and args[0].lower() in ('yes', 'on', 'haan', '1')
+        save_state(s)
+        tg.send('Permission for this stream: ' + ('YES, you may make clips public' if s['permission'] else 'NO, keep everything Private'))
     elif cmd == '/addfriend':
         if len(args) != 1 or not re.fullmatch(r'-?\d{5,15}', args[0]):
             return tg.send('Usage: /addfriend CHATID (your friend sends /id to this bot to get it, and must send /start first)')
@@ -476,7 +502,7 @@ def handle(m, tg, text, role='owner'):
         if not args:
             return tg.send('Usage: /watch LINK')
         url = normalise(args[0])
-        s['channel'] = None
+        s['channel'], s['permission'] = None, False
         s['credit'] = {'author': '', 'url': url}
         threading.Thread(target=lambda: s.__setitem__('credit', {'author': (probe_live(url) or {}).get('author', ''), 'url': url}), daemon=True).start()
         m.start(url)
@@ -652,8 +678,8 @@ def make_caption(path, state):
     for t in [CORE_TAGS[0], CORE_TAGS[1], CORE_TAGS[2]] + extra + CORE_TAGS[3:]:
         if t not in tags_all:
             tags_all.append(t)
-    yt_tags = ' '.join('#' + t for t in tags_all[:12])
-    ig_tags = ' '.join('#' + t for t in [t for t in tags_all if t != 'Shorts'][:8]) + ' #Reels'
+    yt_tags = ' '.join('#' + t for t in tags_all[:7])
+    ig_tags = ' '.join('#' + t for t in [t for t in tags_all if t != 'Shorts'][:4]) + ' #Reels'
     credit = state.get('credit') or {}
     who = credit.get('author') or '(add the streamer name)'
     src = f' ({credit["url"]})' if credit.get('url') else ''
@@ -664,7 +690,7 @@ def make_caption(path, state):
             f'{what}{quote}'
             f'👍 Like karo • 🔔 Subscribe karo roz ke {topic} clips aur reactions ke liye • 💬 Apna reaction comment me likho\n\n'
             f'🎬 Source: {who}{src}\n'
-            f'Fan clip, no copyright intended. Credit ya removal ke liye DM karo.\n\n'
+            f'Not affiliated with Rockstar Games or Take-Two. Fan clip: bolo toh turant hata dunga, DM karo.\n\n'
             f'{yt_tags}')
     ig_hook = hook or label or 'Chat went wild'
     ig = (f'{ig_hook} {emo}{e2}\n'
@@ -773,7 +799,7 @@ def upload_youtube(path, cap):
 
 def do_upload(tg, state, name, replier):
     path = CLIPS / name
-    day = time.strftime('%Y-%m-%d')
+    day = time.strftime('%Y-%m-%d', time.gmtime(time.time() - 8 * 3600))  # YouTube quota resets at midnight Pacific
     try:
         if state['uploads']['day'] != day:
             state['uploads'] = {'day': day, 'n': 0}
@@ -815,8 +841,9 @@ def send_clip(tg, path, info=None):
     except Exception:  # noqa: BLE001
         cap = None
     markup = clip_markup(path, cap) if cap else None
+    ok = True
     if size <= TG_LIMIT:
-        tg.send_video(path, path.name, markup=markup)
+        ok = tg.send_video(path, path.name, markup=markup)
     else:
         tg.send(f'{path.name} is {size / 1e6:.0f} MB, too big for Telegram. Making a smaller copy...')
         try:
@@ -824,7 +851,7 @@ def send_clip(tg, path, info=None):
         except Exception as e:  # noqa: BLE001
             return tg.send(f'Could not shrink {path.name} ({type(e).__name__}). The full clip is on the laptop in output/clips.')
         try:
-            tg.send_video(small, path.name, markup=markup)
+            ok = tg.send_video(small, path.name, markup=markup)
         finally:
             small.unlink(missing_ok=True)
     try:
@@ -833,7 +860,8 @@ def send_clip(tg, path, info=None):
         head = ''
         if cap:
             sc, verdict = score_clip(path, info or {}, cap)
-            head = f'<b>⭐ {sc}/10, {H.escape(verdict)}</b>\n\n'
+            perm = '✅ Creator permission: yes' if CURRENT_STATE.get('permission') else '🔒 NO PERMISSION YET: keep it PRIVATE'
+            head = f'<b>⭐ {sc}/10, {H.escape(verdict)}</b>\n{perm}\n\n'
         tg.send_all(head + '<b>YOUTUBE TITLE</b> (tap to copy)\n' + pre(cap['title']) +
                     '\n<b>YOUTUBE DESCRIPTION</b> (tap to copy)\n' + pre(cap['description']) +
                     '\n<b>INSTAGRAM CAPTION</b> (tap to copy)\n' + pre(cap['ig']) +
@@ -841,6 +869,93 @@ def send_clip(tg, path, info=None):
                     '\n<b>REPLIES for comments</b>\n' + pre('\n'.join(cap['replies'])), html=True)
     except Exception as e:  # noqa: BLE001
         tg.send_all(f'(could not write a caption: {type(e).__name__})')
+    return ok
+
+
+PENDING_AUTH = {}
+
+
+
+def yt_auth_start(tg):
+    secret = HERE / 'client_secret.json'
+    if not secret.exists():
+        return tg.send('client_secret.json is not on the laptop yet.')
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    flow = InstalledAppFlow.from_client_secrets_file(str(secret), ['https://www.googleapis.com/auth/youtube.upload'])
+    flow.redirect_uri = 'http://localhost:8080/'
+    url, _ = flow.authorization_url(prompt='consent', access_type='offline')
+    PENDING_AUTH['flow'], PENDING_AUTH['t'] = flow, time.time()
+    tg.send('YouTube sign-in, on your phone:\n'
+            '1) Tap the link in the NEXT message.\n'
+            '2) Sign in with the channel account. Tap Continue (not Back to safety), then Continue or Allow.\n'
+            '3) You reach a page that says "This site can\'t be reached". That is correct.\n'
+            '4) Tap the Share icon at the top right, choose Telegram, choose this bot, tap Send. Nothing else to do.\n'
+            'You have 15 minutes. (If the link will not open, long-press it, Copy, paste it in Chrome.)')
+    tg.send(url)
+
+
+def yt_auth_finish(tg, address):
+    flow = PENDING_AUTH.get('flow')
+    if not flow or time.time() - PENDING_AUTH.get('t', 0) > 900:
+        return tg.send('No sign-in in progress (or it expired). Send /ytauth first.')
+    if not address.startswith('http://localhost'):
+        return tg.send('That is not the right address. It must start with http://localhost:8080/?state=...')
+    os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'  # the redirect is http://localhost, on purpose
+    try:
+        flow.fetch_token(authorization_response=address)
+    except Exception as e:  # noqa: BLE001
+        return tg.send(f'Sign-in failed ({type(e).__name__}). Send /ytauth for a fresh link and try again.')
+    YT_TOKEN.write_text(flow.credentials.to_json())
+    PENDING_AUTH.clear()
+    tg.send('YouTube is connected. New clips now have the ⬆ YouTube (Private) button. You can delete the message with the address.')
+
+
+def latest_recording():
+    recs = recordings()
+    return recs[-1] if recs else None
+
+
+def clip_now(tg, m, back):
+    """Cut the last `back` seconds of the recording that is being written right now, and let the normal sender deliver it."""
+    time.sleep(6)  # let the recording catch up a little
+    rec = latest_recording()
+    if rec is None:
+        return tg.send('No recording yet. Start one with /watch.')
+    try:
+        dur = float(subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', str(rec)],
+                                   capture_output=True, text=True, check=True).stdout.strip())
+    except Exception:  # noqa: BLE001
+        return tg.send('Could not read the recording yet. Try again in a few seconds.')
+    s = m.state['settings']
+    cmd = [sys.executable, WATCHER, '--file', str(rec), '--at', str(int(dur)), '--before', str(back), '--window', '0',
+           '--length', str(back + 5), '--model', str(s['model']), '--out', str(OUT)]
+    if not s['captions']:
+        cmd.append('--no-captions')
+    if s.get('crop'):
+        cmd.append('--crop')
+    tg.send(f'Cutting the last {back} s. It arrives in a minute or two.')
+    p = subprocess.run(cmd, capture_output=True, text=True, cwd=HERE)
+    if p.returncode != 0:
+        tg.send('Cutting failed: ' + (p.stderr or p.stdout)[-200:])
+
+
+def clear_clips(tg, hours=1):
+    """Delete finished clips (and their caption files) older than `hours`. Never touches a clip still being made."""
+    if not CLIPS.exists():
+        return tg.send('No clips folder yet.')
+    limit = time.time() - hours * 3600
+    n, freed = 0, 0
+    for p in list(CLIPS.glob('*.mp4')) + list(CLIPS.glob('*.srt')) + list((CLIPS / 'captions').glob('*.srt')):
+        if '.raw.' in p.name or '.tmp.' in p.name:
+            continue
+        try:
+            if p.stat().st_mtime < limit:
+                freed += p.stat().st_size
+                p.unlink()
+                n += 1
+        except OSError:
+            pass
+    tg.send(f'Deleted {n} old files ({freed / 1e6:.0f} MB). Clips newer than {hours} h were kept.')
 
 
 def code_version():
@@ -929,6 +1044,7 @@ def do_rollback(tg, m):
 def clip_sender(tg, state):
     """Send each new finished clip. A clip counts as finished when it has not changed for 10 s."""
     sent = set(state.get('sent') or [])
+    tries = {}
     if 'sent' not in state:  # first run: do not flood the phone with old test clips
         sent = {p.name for p in CLIPS.glob('*.mp4')} if CLIPS.exists() else set()
         state['sent'] = sorted(sent)
@@ -944,10 +1060,25 @@ def clip_sender(tg, state):
             if info['black'] > 0.6:
                 tg.send(f'Skipped {p.name}: it is mostly black. (/clips can still send it.)')
             else:
-                send_clip(tg, p, info)
+                if send_clip(tg, p, info) is False:
+                    tries[p.name] = tries.get(p.name, 0) + 1
+                    if tries[p.name] < 3:
+                        continue  # try again in a few seconds
             sent.add(p.name)
             state['sent'] = sorted(sent)
             save_state(state)
+
+
+def heartbeat(tg, m):
+    """One short 'still alive' message every 30 minutes while a stream is being watched. No message = something is wrong."""
+    while True:
+        time.sleep(1800)
+        if not m.running():
+            continue
+        up = int(time.time() - m.started)
+        warn = '\n⚠ YouTube quota used up: auto-clips are off, use /clipnow.' if 'quota used up' in tail(WATCHER_LOG, 40) else ''
+        n = len(list(CLIPS.glob('*.mp4'))) if CLIPS.exists() else 0
+        tg.send(f'💓 alive • watching {up // 3600}h {up % 3600 // 60}m • clips {n} • disk {free_gb():.0f} GB{warn}')
 
 
 def disk_watch(tg):
@@ -979,7 +1110,7 @@ def main():
     tg.viewers = [str(v) for v in state['viewers']]
     keep_awake()
     kill_leftover(state)
-    for fn, a in ((m.supervise, ()), (clip_sender, (tg, state)), (disk_watch, (tg,))):
+    for fn, a in ((m.supervise, ()), (clip_sender, (tg, state)), (disk_watch, (tg,)), (heartbeat, (tg, m))):
         threading.Thread(target=fn, args=a, daemon=True).start()
     if chat:
         tg.send(f'Bot is online on the laptop (code {code_version()}).' + (f'\nResuming {state["url"]}' if state['desired'] else ''))

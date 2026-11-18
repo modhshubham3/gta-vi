@@ -115,3 +115,7 @@ Limits you cannot code around: uploads from unaudited API projects are forced to
 ## Manual clip: /clipnow
 
 On a very busy chat the API-based counter saturates (the message count stays flat, so no spike is ever seen). `/clipnow [seconds]` (owner and admins) cuts the last 25 s (10 to 60) of the recording that is being written right now, with captions, and the normal sender delivers it. Watch the stream yourself and send it when something happens.
+
+## Launch-night hardening
+
+`/permission yes|no` marks whether the streamer allowed clips (default no; every clip message says so). A heartbeat message every 30 minutes while watching (a missing heartbeat means something is wrong; it also warns when the YouTube quota is used up). Telegram 429 (too many requests) is waited out and retried once, and a clip is only marked as sent once it really arrived. The upload counter follows the quota's Pacific-time day. The streamer's name is printed on every clip (`output/credit.txt`, written by the bot). Before pushing, run `python -m pyflakes bot.py clip_watcher.py`: `py_compile` does not catch calls to functions that were deleted by mistake.

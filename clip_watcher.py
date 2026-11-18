@@ -242,6 +242,7 @@ class Recorder(threading.Thread):
 # ---------- Clip making: FFmpeg cut, Whisper captions, vertical render ----------
 _model = None
 DEVICE = 'auto'  # auto: try the GPU, fall back to the CPU
+OUT_DIR = 'output'  # set from --out; the bot keeps the streamer's name in <out>/credit.txt
 
 
 def whisper_model(name, cpu=False):
@@ -301,6 +302,13 @@ def write_captions(media, srt, model_name, words_per_cue=3):
         if out and start < out[-1][1]:
             out[-1][1] = max(out[-1][0] + 0.1, start - 0.01)
         out.append([start, end, text])
+    try:  # on-screen credit for the streamer, small, at the top, for the whole clip
+        who = (Path(OUT_DIR) / 'credit.txt').read_text(encoding='utf-8').strip()
+    except OSError:
+        who = ''
+    if who:
+        out.append([0.0, len(audio) / 16000.0, '{\\an8}{\\fs9}CLIP: ' + who.upper()])
+    out.sort(key=lambda cue: cue[0])
     with open(srt, 'w', encoding='utf-8') as f:
         for n, (a, b, text) in enumerate(out, 1):
             f.write(f'{n}\n{srt_time(a)} --> {srt_time(b)}\n{text}\n\n')
@@ -326,7 +334,7 @@ def make_clip(src, start, length, out, model_name='base', captions=True, crop=Fa
     n_words = 0
     if captions:
         n_words = write_captions(raw, srt, model_name)
-        if n_words:
+        if n_words or srt.stat().st_size > 0:
             style = 'FontName=Arial,Fontsize=16,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Shadow=0,Alignment=2,MarginV=60'
             vf += f",subtitles={srt.name}:force_style='{style}'"
     # Run from the clip's folder so the subtitles path needs no escaping on Windows.
@@ -447,8 +455,8 @@ def main():
     p.add_argument('--file', help='make one clip from a saved recording instead of watching live')
     p.add_argument('--at', type=float, help='with --file: the moment to clip, in seconds')
     args = p.parse_args()
-    global DEVICE
-    DEVICE = args.device
+    global DEVICE, OUT_DIR
+    DEVICE, OUT_DIR = args.device, args.out
 
     missing = [t for t in ('ffmpeg',) + (() if args.file else ('streamlink',)) if not shutil.which(t)]
     if missing:
