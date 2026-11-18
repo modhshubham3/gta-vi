@@ -10,6 +10,8 @@ What it does
 It only talks OUT to Telegram (no ports to open) and only obeys the one chat in CHAT_ID.
 Secrets live in bot.env, never in this file. See bot.env.example.
 """
+import hashlib
+import io
 import json
 import os
 import re
@@ -19,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+import zipfile
 from pathlib import Path
 
 import requests
@@ -30,6 +33,9 @@ STATE_FILE = OUT / 'bot_state.json'
 WATCHER_LOG = OUT / 'watcher.log'
 WATCHER = os.environ.get('BOT_WATCHER_SCRIPT') or str(HERE / 'clip_watcher.py')
 WIN = os.name == 'nt'
+UPDATE_FILES = ('bot.py', 'clip_watcher.py', 'requirements.txt')
+BACKUP = HERE / 'backup'
+TG_LIMIT = 48 * 1024 * 1024  # Telegram bots can upload up to 50 MB
 
 DEFAULTS = {'ratio': 2.5, 'min_msgs': 20, 'window': 10.0, 'quality': '720p60', 'model': 'tiny',
             'api_poll': 10.0, 'gap': 60.0, 'length': 30.0, 'before': 15.0, 'captions': True, 'verbose': True}
@@ -282,6 +288,8 @@ HELP = '''/watch LINK   start (YouTube live link or Twitch channel name/link)
 /settings   show settings
 /set NAME VALUE   change a setting, then /restart
 /restart   restart with the current settings
+/update   download the latest code from GitHub and restart
+/rollback   undo the last /update
 /id   show your chat id'''
 
 
@@ -304,7 +312,11 @@ def handle(m, tg, text):
     elif cmd == '/restart':
         tg.send('Restarting.' if m.start() else 'Nothing to restart. Use /watch LINK first.')
     elif cmd == '/status':
-        tg.send(status(m))
+        tg.send(f'code {code_version()}\n' + status(m))
+    elif cmd == '/update':
+        do_update(tg, m)
+    elif cmd == '/rollback':
+        do_rollback(tg, m)
     elif cmd == '/disk':
         tg.send(f'{free_gb():.1f} GB free')
     elif cmd == '/clean':
@@ -322,7 +334,7 @@ def handle(m, tg, text):
     elif cmd == '/clips':
         n = min(int(args[0]), 5) if args and args[0].isdigit() else 1
         files = sorted(CLIPS.glob('*.mp4'), key=lambda p: p.stat().st_mtime)[-n:] if CLIPS.exists() else []
-        files = [f for f in files if not f.name.endswith('.raw.mp4')]
+        files = [f for f in files if '.raw.' not in f.name and '.tmp.' not in f.name]
         if not files:
             tg.send('No clips yet.')
         for f in files:
@@ -351,11 +363,116 @@ def handle(m, tg, text):
         tg.send('Unknown command. /help')
 
 
+def shrink_for_telegram(path):
+    """Re-encode a clip that is too big for Telegram. Tries smaller targets until it fits. Returns a temp copy."""
+    dur = float(subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', str(path)],
+                               capture_output=True, text=True, check=True).stdout.strip())
+    tmpdir = OUT / 'tg_tmp'
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    out = tmpdir / path.name
+    for target_mb in (36, 26, 16):
+        vbr = max(200_000, int(target_mb * 1024 * 1024 * 8 / dur) - 128_000)
+        subprocess.run(['ffmpeg', '-y', '-loglevel', 'error', '-i', str(path), '-c:v', 'libx264', '-preset', 'veryfast',
+                        '-b:v', str(vbr), '-maxrate', str(vbr), '-bufsize', str(vbr * 2), '-pix_fmt', 'yuv420p',
+                        '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', str(out)], check=True)
+        if out.stat().st_size <= TG_LIMIT:
+            return out
+    raise RuntimeError('still too big')
+
+
 def send_clip(tg, path):
     size = path.stat().st_size
-    if size > 49 * 1024 * 1024:
-        return tg.send(f'Clip {path.name} is {size / 1e6:.0f} MB, too big for Telegram. It is on the laptop in output/clips.')
-    tg.send_video(path, path.name)
+    if size <= TG_LIMIT:
+        return tg.send_video(path, path.name)
+    tg.send(f'{path.name} is {size / 1e6:.0f} MB, too big for Telegram. Making a smaller copy...')
+    try:
+        small = shrink_for_telegram(path)
+    except Exception as e:  # noqa: BLE001
+        return tg.send(f'Could not shrink {path.name} ({type(e).__name__}). The full clip is on the laptop in output/clips.')
+    try:
+        tg.send_video(small, path.name)
+    finally:
+        small.unlink(missing_ok=True)
+
+
+def code_version():
+    h = hashlib.sha1()
+    for n in ('bot.py', 'clip_watcher.py'):
+        h.update((HERE / n).read_bytes())
+    return h.hexdigest()[:8]
+
+
+def apply_files(files):
+    """Write files next to bot.py, each through a temp file so a crash never leaves a half-written script."""
+    for name, data in files.items():
+        tmp = HERE / (name + '.new')
+        tmp.write_bytes(data)
+        tmp.replace(HERE / name)
+
+
+def restart_after_change(tg, m, changed):
+    """bot.py itself changed: exit so run_bot.bat starts the new one (it resumes the watch). Otherwise just restart the watcher."""
+    if 'bot.py' in changed:
+        if os.environ.get('CLIPBOT_SUPERVISED'):
+            tg.send('Restarting the bot with the new code (back in ~15 s).')
+            m.stop_process()
+            os._exit(3)
+        tg.send('bot.py changed, but I was not started by run_bot.bat, so restart me by hand (python bot.py).')
+    elif m.state.get('desired'):
+        m.start()
+        tg.send('Watcher restarted with the new code.')
+
+
+def do_update(tg, m):
+    repo = os.environ.get('UPDATE_REPO', 'modhshubham3/gta-vi')
+    branch = os.environ.get('UPDATE_BRANCH', 'ccr-cb619668-8pcm8x')
+    url = os.environ.get('UPDATE_URL') or f'https://codeload.github.com/{repo}/zip/refs/heads/{branch}'
+    headers = {'Authorization': 'Bearer ' + os.environ['GITHUB_TOKEN']} if os.environ.get('GITHUB_TOKEN') else {}
+    try:
+        r = requests.get(url, headers=headers, timeout=60)
+    except Exception as e:  # noqa: BLE001
+        return tg.send(f'Update failed: could not reach GitHub ({type(e).__name__}).')
+    if r.status_code == 404:
+        return tg.send('Update failed: 404. If the repo is private, put a read-only GITHUB_TOKEN in bot.env.')
+    if r.status_code != 200:
+        return tg.send(f'Update failed: HTTP {r.status_code}.')
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(r.content))
+        new = {}
+        for info in zf.infolist():
+            parts = info.filename.split('/')
+            if len(parts) == 2 and parts[1] in UPDATE_FILES:
+                new[parts[1]] = zf.read(info)
+        if 'bot.py' not in new or 'clip_watcher.py' not in new:
+            return tg.send('Update failed: the download did not contain bot.py and clip_watcher.py. Nothing changed.')
+        for name, data in new.items():
+            if name.endswith('.py'):
+                compile(data, name, 'exec')  # refuse code that does not even parse
+    except Exception as e:  # noqa: BLE001
+        return tg.send(f'Update refused, nothing changed: {type(e).__name__}.')
+    changed = [n for n, d in new.items() if not (HERE / n).exists() or (HERE / n).read_bytes() != d]
+    if not changed:
+        return tg.send(f'Already up to date (code {code_version()}).')
+    BACKUP.mkdir(exist_ok=True)
+    for n in changed:
+        if (HERE / n).exists():
+            shutil.copy2(HERE / n, BACKUP / n)
+    apply_files({n: new[n] for n in changed})
+    note = ''
+    if 'requirements.txt' in changed:
+        p = subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '-r', str(HERE / 'requirements.txt')], capture_output=True, text=True)
+        note = '\npip install ok' if p.returncode == 0 else '\npip install FAILED, check the laptop'
+    tg.send(f'Updated {", ".join(changed)} (code {code_version()}). /rollback undoes it.{note}')
+    restart_after_change(tg, m, changed)
+
+
+def do_rollback(tg, m):
+    files = {p.name: p.read_bytes() for p in BACKUP.glob('*') if p.name in UPDATE_FILES} if BACKUP.exists() else {}
+    if not files:
+        return tg.send('No backup to roll back to.')
+    apply_files(files)
+    tg.send(f'Rolled back {", ".join(files)} (code {code_version()}).')
+    restart_after_change(tg, m, list(files))
 
 
 def clip_sender(tg, state):
@@ -370,7 +487,7 @@ def clip_sender(tg, state):
         if not CLIPS.exists():
             continue
         for p in sorted(CLIPS.glob('*.mp4'), key=lambda p: p.stat().st_mtime):
-            if p.name in sent or p.name.endswith('.raw.mp4') or time.time() - p.stat().st_mtime < 10:
+            if p.name in sent or '.raw.' in p.name or '.tmp.' in p.name or time.time() - p.stat().st_mtime < 10:
                 continue
             send_clip(tg, p)
             sent.add(p.name)
@@ -407,7 +524,7 @@ def main():
     for fn, a in ((m.supervise, ()), (clip_sender, (tg, state)), (disk_watch, (tg,))):
         threading.Thread(target=fn, args=a, daemon=True).start()
     if chat:
-        tg.send('Bot is online on the laptop.' + (f'\nResuming {state["url"]}' if state['desired'] else ''))
+        tg.send(f'Bot is online on the laptop (code {code_version()}).' + (f'\nResuming {state["url"]}' if state['desired'] else ''))
         if state['desired'] and state['url']:
             m.start()
     else:

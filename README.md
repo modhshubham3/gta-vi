@@ -84,3 +84,9 @@ Built with Claude Code.
 New clips are sent to your phone. The bot restarts the watcher if it crashes, resumes after a reboot, and only obeys the one chat in `CHAT_ID`. **Never commit `bot.env`** (it is in `.gitignore`).
 
 To start at login on Windows: `schtasks /Create /TN ClipBot /SC ONLOGON /TR "\"C:\path\to\run_bot.bat\"" /RL LIMITED`.
+
+## Updating the laptop from your phone
+
+`/update` in the Telegram bot downloads the latest `bot.py`, `clip_watcher.py` and `requirements.txt` from this repo's branch, refuses code that does not parse, keeps a backup (`/rollback` undoes it) and restarts. It only works when the bot was started by `run_bot.bat` (which sets `CLIPBOT_SUPERVISED=1` and restarts the bot after an update); the watch resumes by itself. It never touches `bot.env`. For a private repo, put a read-only `GITHUB_TOKEN` in `bot.env`. Because anything pushed to the branch will run on the laptop, only you should have push access to it.
+
+Clips are encoded at most 8 Mbit/s (about 31 MB for 30 s). A clip over 48 MB is re-encoded smaller before it is sent, because Telegram bots cannot upload more than 50 MB.

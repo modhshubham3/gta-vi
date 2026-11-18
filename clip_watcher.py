@@ -313,6 +313,7 @@ def make_clip(src, start, length, out, model_name='base', captions=True, crop=Fa
     out.parent.mkdir(parents=True, exist_ok=True)
     raw = out.with_suffix('.raw.mp4')
     srt = out.with_suffix('.srt')
+    tmp = out.with_name(out.stem + '.tmp.mp4')
     # 1. Fast cut, no re-encode: works on a recording that is still being written.
     subprocess.run(['ffmpeg', '-y', '-loglevel', 'error', '-ss', f'{max(0, start):.2f}', '-i', str(src), '-t', f'{length:.2f}',
                     '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy', str(raw)], check=True)
@@ -330,8 +331,9 @@ def make_clip(src, start, length, out, model_name='base', captions=True, crop=Fa
             vf += f",subtitles={srt.name}:force_style='{style}'"
     # Run from the clip's folder so the subtitles path needs no escaping on Windows.
     subprocess.run(['ffmpeg', '-y', '-loglevel', 'error', '-i', raw.name, '-filter_complex', vf,
-                    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
-                    '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', out.name], check=True, cwd=out.parent)
+                    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22', '-maxrate', '8M', '-bufsize', '16M', '-pix_fmt', 'yuv420p',
+                    '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', tmp.name], check=True, cwd=out.parent)
+    tmp.replace(out)  # the clip only gets its final name once it is complete, so nothing can send a half-written file
     raw.unlink(missing_ok=True)
     if srt.exists():  # players auto-load a same-named .srt and show captions twice, so file it away
         (out.parent / 'captions').mkdir(exist_ok=True)
