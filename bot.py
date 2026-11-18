@@ -258,10 +258,19 @@ class Manager:
             self.proc = subprocess.Popen(build_cmd(self.state['url'], self.state['settings']), cwd=HERE,
                                          stdout=logf, stderr=subprocess.STDOUT, env=os.environ.copy(), **kw)
             self.started = time.time()
+            threading.Thread(target=self._fill_credit, args=(self.state['url'],), daemon=True).start()
             self.state['pid'] = self.proc.pid
             self.state['desired'] = True
             save_state(self.state)
             return True
+
+    def _fill_credit(self, url):
+        c = self.state.get('credit') or {}
+        if c.get('url') == url and c.get('author'):
+            return
+        info = probe_live(url) or {}
+        if info.get('author') or not c:
+            self.state['credit'] = {'author': info.get('author', ''), 'url': url}
 
     def stop_process(self):
         p = self.proc
@@ -573,7 +582,11 @@ def make_caption(path, state):
     topic = state['settings'].get('topic', 'GTA_6').replace('_', ' ')
     tag = re.sub(r'\W', '', topic) or 'Clips'
     words = clean_text(read_transcript(path)).split()
-    hook = ' '.join(words[:8]).strip(' ,.-').capitalize() if words else 'Chat went wild'
+    weak = {'it', "it's", 'the', 'a', 'an', 'and', 'but', 'so', 'no', 'i', "i'm", 'to', 'of', 'is', 'in', 'on', 'that', 'this', 'you', 'we', 'was', 'with', 'for', 'or', 'oh', 'um', 'uh'}
+    head = words[:8]
+    while head and head[-1].lower().strip(' ,.!?-') in weak:
+        head.pop()  # do not end a title on a dangling word
+    hook = ' '.join(head).strip(' ,.-').capitalize() if head else 'Chat went wild'
     title = f'{hook} | {topic}'[:95]
     credit = state.get('credit') or {}
     who = credit.get('author') or '(add the streamer name)'
