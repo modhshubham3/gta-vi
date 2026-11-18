@@ -33,6 +33,8 @@ STATE_FILE = OUT / 'bot_state.json'
 WATCHER_LOG = OUT / 'watcher.log'
 WATCHER = os.environ.get('BOT_WATCHER_SCRIPT') or str(HERE / 'clip_watcher.py')
 WIN = os.name == 'nt'
+POLL_SECONDS = float(os.environ.get('BOT_POLL_SECONDS', '45'))
+STREAMLINK = os.environ.get('BOT_STREAMLINK_CMD', '').split() or [sys.executable, '-m', 'streamlink_cli']
 UPDATE_FILES = ('bot.py', 'clip_watcher.py', 'requirements.txt')
 BACKUP = HERE / 'backup'
 TG_LIMIT = 48 * 1024 * 1024  # Telegram bots can upload up to 50 MB
@@ -95,6 +97,7 @@ def load_state():
         s['settings'].setdefault(k, v)
     s.setdefault('url', None)
     s.setdefault('desired', False)
+    s.setdefault('channel', None)
     return s
 
 
@@ -110,6 +113,28 @@ def normalise(url):
     if ('youtube.com' in url or 'youtu.be' in url) and not url.startswith('http'):
         url = 'https://' + url
     return url
+
+
+def probe_live(url):
+    """Ask Streamlink (no API quota) whether this URL is live right now. Returns {'id', 'title'} or None."""
+    try:
+        p = subprocess.run(STREAMLINK + ['--json', url], capture_output=True, text=True, timeout=45)
+        d = json.loads(p.stdout)
+    except Exception:  # noqa: BLE001
+        return None
+    meta = d.get('metadata') or {}
+    if d.get('error') or not d.get('streams') or not meta.get('id'):
+        return None
+    return {'id': meta['id'], 'title': meta.get('title') or ''}
+
+
+def channel_url(arg):
+    arg = arg.strip().strip('<>')
+    if arg.startswith('@'):
+        return f'https://www.youtube.com/{arg}/live'
+    if not arg.startswith('http'):
+        arg = 'https://' + arg
+    return arg if arg.rstrip('/').endswith('/live') else arg.rstrip('/') + '/live'
 
 
 def build_cmd(url, s):
@@ -221,12 +246,41 @@ class Manager:
             save_state(self.state)
             self.stop_process()
 
+    def channel_tick(self, ch):
+        """Channel mode: wait for the channel to go live, record that stream, go back to waiting when it ends."""
+        now = time.time()
+        if now - getattr(self, 'last_poll', 0) < POLL_SECONDS:
+            return
+        self.last_poll = now
+        if self.running():
+            if probe_live(self.state['url']):
+                self.misses = 0
+            else:
+                self.misses = getattr(self, 'misses', 0) + 1
+                if self.misses >= 3:
+                    self.misses = 0
+                    self.stop_process()
+                    self.state['url'] = None
+                    save_state(self.state)
+                    self.tg.send('The stream ended. Waiting for the next live on this channel.')
+            return
+        info = probe_live(ch)
+        if info:
+            url = f'https://www.youtube.com/watch?v={info["id"]}'
+            self.tg.send(f'LIVE now: {info["title"][:80]}\nRecording and clipping {url}')
+            self.start(url)
+
     def supervise(self):
         """If it should be running but isn't, restart it. Give up after 5 crashes in 10 minutes."""
         while True:
             time.sleep(5)
             with self.lock:
-                if not self.state['desired'] or self.running():
+                if not self.state['desired']:
+                    continue
+                if self.state.get('channel'):
+                    self.channel_tick(self.state['channel'])
+                    continue
+                if self.running():
                     continue
                 now = time.time()
                 self.crashes = [t for t in self.crashes if now - t < 600] + [now]
@@ -267,6 +321,8 @@ def status(m):
     if m.running():
         up = int(time.time() - m.started)
         lines.append(f'RUNNING for {up // 3600}h {up % 3600 // 60}m on {s["url"]}')
+    elif s['desired'] and s.get('channel'):
+        lines.append(f'WAITING for {s["channel"]} to go live (checks every {POLL_SECONDS:.0f} s)')
     else:
         lines.append('STOPPED' + (f' (wanted: {s["url"]})' if s['desired'] else ''))
     recs = recordings()
@@ -280,6 +336,7 @@ def status(m):
 
 
 HELP = '''/watch LINK   start (YouTube live link or Twitch channel name/link)
+/waitfor @channel   wait for that YouTube channel to go live, then record and clip it by itself
 /stop   stop watching
 /status   what is happening now
 /clips [n]   send the last n clips (default 1)
@@ -304,8 +361,17 @@ def handle(m, tg, text):
         if not args:
             return tg.send('Usage: /watch LINK')
         url = normalise(args[0])
+        s['channel'] = None
         m.start(url)
         tg.send(f'Started watching {url}\nIt waits until the stream is live, then records and clips. /status to check.')
+    elif cmd == '/waitfor':
+        if not args:
+            return tg.send('Usage: /waitfor @channelhandle')
+        m.stop_process()
+        s['channel'], s['url'], s['desired'] = channel_url(args[0]), None, True
+        save_state(s)
+        m.last_poll = 0
+        tg.send(f'Waiting for {s["channel"]} to go live. I will start by myself and tell you.')
     elif cmd == '/stop':
         m.stop()
         tg.send('Stopped.')
@@ -398,7 +464,10 @@ def send_clip(tg, path):
 def code_version():
     h = hashlib.sha1()
     for n in ('bot.py', 'clip_watcher.py'):
-        h.update((HERE / n).read_bytes())
+        try:
+            h.update((HERE / n).read_bytes())
+        except OSError:
+            pass
     return h.hexdigest()[:8]
 
 
@@ -525,7 +594,7 @@ def main():
         threading.Thread(target=fn, args=a, daemon=True).start()
     if chat:
         tg.send(f'Bot is online on the laptop (code {code_version()}).' + (f'\nResuming {state["url"]}' if state['desired'] else ''))
-        if state['desired'] and state['url']:
+        if state['desired'] and state['url'] and not state.get('channel'):
             m.start()
     else:
         log('CHAT_ID not set yet: send /id to the bot and put the number in bot.env')

@@ -90,3 +90,7 @@ To start at login on Windows: `schtasks /Create /TN ClipBot /SC ONLOGON /TR "\"C
 `/update` in the Telegram bot downloads the latest `bot.py`, `clip_watcher.py` and `requirements.txt` from this repo's branch, refuses code that does not parse, keeps a backup (`/rollback` undoes it) and restarts. It only works when the bot was started by `run_bot.bat` (which sets `CLIPBOT_SUPERVISED=1` and restarts the bot after an update); the watch resumes by itself. It never touches `bot.env`. For a private repo, put a read-only `GITHUB_TOKEN` in `bot.env`. Because anything pushed to the branch will run on the laptop, only you should have push access to it.
 
 Clips are encoded at most 8 Mbit/s (about 31 MB for 30 s). A clip over 48 MB is re-encoded smaller before it is sent, because Telegram bots cannot upload more than 50 MB.
+
+## Waiting for a channel to go live
+
+`/waitfor @channelhandle` makes the bot poll `https://www.youtube.com/@channelhandle/live` with Streamlink every 45 s (no API quota). When the channel goes live it starts recording and clipping that stream, tells you on Telegram, and when the stream ends it goes back to waiting. One stream at a time: a laptop cannot render clips for several streams.
