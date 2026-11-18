@@ -603,7 +603,8 @@ KEYWORDS = [  # (words to look for, emoji, label shown in the title, extra hasht
 CORE_TAGS = ['GTA6', 'Shorts', 'GTAVI', 'GrandTheftAutoVI', 'GTA6Gameplay', 'GTA6Launch', 'GTA6Release', 'ViceCity', 'Rockstar', 'Gaming']
 STOP = {'it', "it's", 'the', 'a', 'an', 'and', 'but', 'so', 'no', 'i', "i'm", 'to', 'of', 'is', 'in', 'on', 'that', 'this', 'you', 'we', 'was',
         'with', 'for', 'or', 'oh', 'um', 'uh', 'he', 'she', 'they', 'me', 'my', 'at', 'be', 'are', 'do', 'if', 'what', 'just',
-        'before', 'after', 'because', 'when', 'while', 'then', 'than', 'there', 'here', 'out', 'up', 'from', 'about', 'into'}
+        'before', 'after', 'because', 'when', 'while', 'then', 'than', 'there', 'here', 'out', 'up', 'from', 'about', 'into',
+        'get', 'need', 'want', 'going', 'gonna', 'got', 'have', 'has', 'can', 'will', 'would', 'should'}
 
 
 def cut_words(text, limit):
