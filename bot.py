@@ -598,7 +598,8 @@ def make_caption(path, state):
     tags = f'#{tag} #Shorts #Gaming'
     desc = f'{hook}\n\nCredit: {who}{src}\nFan clip, no copyright intended. DM for removal.\n\n{tags}'
     ig = f'{hook} 🔥\nCredit: {who}\n{tags} #Reels'
-    return {'title': title, 'description': desc, 'ig': ig, 'tags': [topic, tag, 'Shorts', 'Gaming']}
+    desc_copy = f'{hook}\n\nCredit: {who}\nFan clip. DM for removal.\n{tags}'
+    return {'title': title, 'description': desc, 'desc_copy': desc_copy, 'ig': ig, 'tags': [topic, tag, 'Shorts', 'Gaming']}
 
 
 PENDING_AUTH = {}
@@ -638,10 +639,15 @@ def yt_auth_finish(tg, address):
     tg.send('YouTube is connected. New clips now have the ⬆ YouTube (Private) button. You can delete the message with the address.')
 
 
-def yt_markup(path):
-    if not YT_TOKEN.exists() or path.name in CURRENT_STATE.get('uploaded', {}):
-        return None
-    return json.dumps({'inline_keyboard': [[{'text': '⬆ YouTube (Private)', 'callback_data': 'yt:' + path.name}]]})
+def clip_markup(path, cap):
+    """Buttons under each clip: upload to YouTube (Private) and one-tap COPY of the title, description and Instagram caption."""
+    rows = []
+    if YT_TOKEN.exists() and path.name not in CURRENT_STATE.get('uploaded', {}):
+        rows.append([{'text': '⬆ YouTube (Private)', 'callback_data': 'yt:' + path.name}])
+    rows.append([{'text': '📋 Title', 'copy_text': {'text': cap['title'][:256]}},
+                 {'text': '📋 Description', 'copy_text': {'text': cap['desc_copy'][:256]}}])
+    rows.append([{'text': '📋 Instagram caption', 'copy_text': {'text': cap['ig'][:256]}}])
+    return json.dumps({'inline_keyboard': rows})
 
 
 def upload_youtube(path, cap):
@@ -703,7 +709,11 @@ def handle_callback(tg, m, cb):
 
 def send_clip(tg, path):
     size = path.stat().st_size
-    markup = yt_markup(path)
+    try:
+        cap = make_caption(path, CURRENT_STATE)
+    except Exception:  # noqa: BLE001
+        cap = None
+    markup = clip_markup(path, cap) if cap else None
     if size <= TG_LIMIT:
         tg.send_video(path, path.name, markup=markup)
     else:
@@ -717,7 +727,6 @@ def send_clip(tg, path):
         finally:
             small.unlink(missing_ok=True)
     try:
-        cap = make_caption(path, CURRENT_STATE)
         tg.send_all(f'YOUTUBE TITLE:\n{cap["title"]}\n\nDESCRIPTION:\n{cap["description"]}\n\nINSTAGRAM CAPTION:\n{cap["ig"]}')
     except Exception as e:  # noqa: BLE001
         tg.send_all(f'(could not write a caption: {type(e).__name__})')
