@@ -35,14 +35,18 @@ WATCHER = os.environ.get('BOT_WATCHER_SCRIPT') or str(HERE / 'clip_watcher.py')
 WIN = os.name == 'nt'
 POLL_SECONDS = float(os.environ.get('BOT_POLL_SECONDS', '45'))
 STREAMLINK = os.environ.get('BOT_STREAMLINK_CMD', '').split() or [sys.executable, '-m', 'streamlink_cli']
-UPDATE_FILES = ('bot.py', 'clip_watcher.py', 'requirements.txt')
+UPDATE_FILES = ('bot.py', 'clip_watcher.py', 'requirements.txt', 'yt_auth.py')
+YT_TOKEN = HERE / 'yt_token.json'
+YT_DAILY_LIMIT = 5  # one upload costs ~1600 of the 10,000 daily API quota units
+BAD_WORDS = ('fuck', 'shit', 'bitch', 'asshole', 'dick', 'cunt', 'bastard', 'nigga', 'nigger')
+CURRENT_STATE = {}
 BACKUP = HERE / 'backup'
 TG_LIMIT = 48 * 1024 * 1024  # Telegram bots can upload up to 50 MB
 
 DEFAULTS = {'ratio': 2.5, 'min_msgs': 20, 'window': 10.0, 'quality': '720p60', 'model': 'tiny',
-            'api_poll': 10.0, 'gap': 60.0, 'length': 30.0, 'before': 15.0, 'captions': True, 'verbose': True}
+            'api_poll': 10.0, 'gap': 60.0, 'length': 30.0, 'before': 15.0, 'captions': True, 'verbose': True, 'topic': 'GTA_6'}
 KINDS = {'ratio': float, 'min_msgs': int, 'window': float, 'quality': str, 'model': str,
-         'api_poll': float, 'gap': float, 'length': float, 'before': float, 'captions': bool, 'verbose': bool}
+         'api_poll': float, 'gap': float, 'length': float, 'before': float, 'captions': bool, 'verbose': bool, 'topic': str}
 FLAGS = {'ratio': '--ratio', 'min_msgs': '--min-msgs', 'window': '--window', 'quality': '--quality',
          'model': '--model', 'api_poll': '--api-poll', 'gap': '--gap', 'length': '--length', 'before': '--before'}
 
@@ -81,19 +85,24 @@ class Telegram:
         for i in range(0, max(len(text), 1), 4000):
             self.call('sendMessage', chat_id=chat_id or self.chat_id, text=text[i:i + 4000])
 
-    def send_video(self, path, caption='', only=None):
+    def send_video(self, path, caption='', only=None, markup=None):
         """Send a clip to the owner and every friend (or just `only`). It is uploaded once; the others get it by file_id."""
         targets = [only] if only else [self.chat_id] + list(self.viewers)
         file_id = None
+        extra = {'reply_markup': markup} if markup else {}
         for t in targets:
             if file_id:
-                self.call('sendVideo', chat_id=t, video=file_id, caption=caption[:900])
+                self.call('sendVideo', chat_id=t, video=file_id, caption=caption[:900], **extra)
                 continue
             with open(path, 'rb') as f:
                 r = self.call('sendVideo', http_timeout=300, files={'video': f}, chat_id=t,
-                              caption=caption[:900], supports_streaming='true', width=1080, height=1920)
+                              caption=caption[:900], supports_streaming='true', width=1080, height=1920, **extra)
             if isinstance(r, dict):
                 file_id = (r.get('video') or {}).get('file_id')
+
+    def send_all(self, text, only=None):
+        for t in ([only] if only else [self.chat_id] + list(self.viewers)):
+            self.send(text, chat_id=t)
 
     def broadcast(self, text):
         for t in [self.chat_id] + list(self.viewers):
@@ -109,8 +118,11 @@ class Replier:
     def send(self, text, chat_id=None):
         self.tg.send(text, chat_id=self.cid)
 
-    def send_video(self, path, caption=''):
-        self.tg.send_video(path, caption, only=self.cid)
+    def send_video(self, path, caption='', markup=None):
+        self.tg.send_video(path, caption, only=self.cid, markup=markup)
+
+    def send_all(self, text):
+        self.tg.send(text, chat_id=self.cid)
 
 
 # ---------- State ----------
@@ -127,6 +139,9 @@ def load_state():
     s.setdefault('channel', None)
     s.setdefault('viewers', [])
     s.setdefault('admins', [])
+    s.setdefault('uploaded', {})
+    s.setdefault('uploads', {'day': '', 'n': 0})
+    s.setdefault('credit', None)
     return s
 
 
@@ -154,7 +169,7 @@ def probe_live(url):
     meta = d.get('metadata') or {}
     if d.get('error') or not d.get('streams') or not meta.get('id'):
         return None
-    return {'id': meta['id'], 'title': meta.get('title') or ''}
+    return {'id': meta['id'], 'title': meta.get('title') or '', 'author': meta.get('author') or ''}
 
 
 def channel_url(arg):
@@ -297,6 +312,7 @@ class Manager:
         if info:
             url = f'https://www.youtube.com/watch?v={info["id"]}'
             self.tg.broadcast(f'LIVE now: {info["title"][:80]}\nRecording and clipping {url}')
+            self.state['credit'] = {'author': info.get('author', ''), 'url': url}
             self.start(url)
 
     def supervise(self):
@@ -371,6 +387,7 @@ HELP = '''/watch LINK   start (YouTube live link or Twitch channel name/link)
 /clips [n]   send the last n clips (default 1)
 /disk   free disk space
 /clean   delete finished recordings to free space
+Tap the ⬆ button under a clip to upload it to YouTube as Private (owner and admins)
 /settings   show settings
 /set NAME VALUE   change a setting, then /restart
 /restart   restart with the current settings
@@ -439,6 +456,8 @@ def handle(m, tg, text, role='owner'):
             return tg.send('Usage: /watch LINK')
         url = normalise(args[0])
         s['channel'] = None
+        s['credit'] = {'author': '', 'url': url}
+        threading.Thread(target=lambda: s.__setitem__('credit', {'author': (probe_live(url) or {}).get('author', ''), 'url': url}), daemon=True).start()
         m.start(url)
         tg.send(f'Started watching {url}\nIt waits until the stream is live, then records and clips. /status to check.')
     elif cmd == '/waitfor':
@@ -523,19 +542,123 @@ def shrink_for_telegram(path):
     raise RuntimeError('still too big')
 
 
+def read_transcript(path):
+    """The words Whisper heard in this clip, from the .srt that clip_watcher filed away."""
+    srt = path.parent / 'captions' / (path.stem + '.srt')
+    try:
+        lines = srt.read_text(encoding='utf-8').splitlines()
+    except OSError:
+        return ''
+    words = [l.strip() for l in lines if l.strip() and not l.strip().isdigit() and '-->' not in l]
+    return ' '.join(words)
+
+
+def clean_text(text):
+    """Mask swear words so they do not end up in a public title."""
+    def mask(m):
+        w = m.group(0)
+        return w[0] + '*' * (len(w) - 1)
+    return re.sub(r'(?i)\b\w*(' + '|'.join(BAD_WORDS) + r')\w*\b', mask, text)
+
+
+def make_caption(path, state):
+    topic = state['settings'].get('topic', 'GTA_6').replace('_', ' ')
+    tag = re.sub(r'\W', '', topic) or 'Clips'
+    words = clean_text(read_transcript(path)).split()
+    hook = ' '.join(words[:8]).strip(' ,.-').capitalize() if words else 'Chat went wild'
+    title = f'{hook} | {topic}'[:95]
+    credit = state.get('credit') or {}
+    who = credit.get('author') or '(add the streamer name)'
+    src = f' ({credit["url"]})' if credit.get('url') else ''
+    tags = f'#{tag} #Shorts #Gaming'
+    desc = f'{hook}\n\nCredit: {who}{src}\nFan clip, no copyright intended. DM for removal.\n\n{tags}'
+    ig = f'{hook} 🔥\nCredit: {who}\n{tags} #Reels'
+    return {'title': title, 'description': desc, 'ig': ig, 'tags': [topic, tag, 'Shorts', 'Gaming']}
+
+
+def yt_markup(path):
+    if not YT_TOKEN.exists() or path.name in CURRENT_STATE.get('uploaded', {}):
+        return None
+    return json.dumps({'inline_keyboard': [[{'text': '⬆ YouTube (Private)', 'callback_data': 'yt:' + path.name}]]})
+
+
+def upload_youtube(path, cap):
+    """Upload as PRIVATE (Google forces that for unaudited API projects anyway). Returns the video id."""
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
+    creds = Credentials.from_authorized_user_file(str(YT_TOKEN), ['https://www.googleapis.com/auth/youtube.upload'])
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        YT_TOKEN.write_text(creds.to_json())
+    yt = build('youtube', 'v3', credentials=creds, cache_discovery=False)
+    body = {'snippet': {'title': cap['title'], 'description': cap['description'][:4900], 'tags': cap['tags'], 'categoryId': '20'},
+            'status': {'privacyStatus': 'private', 'selfDeclaredMadeForKids': False}}
+    req = yt.videos().insert(part='snippet,status', body=body, media_body=MediaFileUpload(str(path), mimetype='video/mp4', resumable=True, chunksize=-1))
+    resp = None
+    while resp is None:
+        _, resp = req.next_chunk()
+    return resp['id']
+
+
+def do_upload(tg, state, name, replier):
+    path = CLIPS / name
+    day = time.strftime('%Y-%m-%d')
+    try:
+        if state['uploads']['day'] != day:
+            state['uploads'] = {'day': day, 'n': 0}
+        if state['uploads']['n'] >= YT_DAILY_LIMIT:
+            return replier.send(f'Daily upload limit reached ({YT_DAILY_LIMIT}): the YouTube quota allows about 6 uploads a day. Post this one by hand, or wait until tomorrow.')
+        replier.send(f'Uploading {name} to YouTube as Private...')
+        vid = upload_youtube(path, make_caption(path, state))
+        state['uploads']['n'] += 1
+        state['uploaded'][name] = vid
+        save_state(state)
+        tg.broadcast(f'Uploaded as PRIVATE: https://youtu.be/{vid}\nMake it public: https://studio.youtube.com/video/{vid}/edit\n(uploads today: {state["uploads"]["n"]}/{YT_DAILY_LIMIT})')
+    except Exception as e:  # noqa: BLE001
+        replier.send(f'YouTube upload failed ({type(e).__name__}: {str(e)[:150]}). Post this clip by hand.')
+
+
+def handle_callback(tg, m, cb):
+    cid = str((cb.get('message') or {}).get('chat', {}).get('id', ''))
+    data = cb.get('data') or ''
+    tg.call('answerCallbackQuery', callback_query_id=cb.get('id'))
+    state = m.state
+    is_owner = cid == str(tg.chat_id)
+    if not (is_owner or cid in [str(a) for a in state['admins']]):
+        return tg.send('Only the owner or an admin can upload.', chat_id=cid)
+    replier = tg if is_owner else Replier(tg, cid)
+    if not data.startswith('yt:'):
+        return
+    name = data[3:]
+    if not re.fullmatch(r'[\w.-]+\.mp4', name) or not (CLIPS / name).exists():
+        return replier.send('That clip is not on the laptop any more.')
+    if name in state['uploaded']:
+        return replier.send(f'Already uploaded: https://youtu.be/{state["uploaded"][name]}')
+    threading.Thread(target=do_upload, args=(tg, state, name, replier), daemon=True).start()
+
+
 def send_clip(tg, path):
     size = path.stat().st_size
+    markup = yt_markup(path)
     if size <= TG_LIMIT:
-        return tg.send_video(path, path.name)
-    tg.send(f'{path.name} is {size / 1e6:.0f} MB, too big for Telegram. Making a smaller copy...')
+        tg.send_video(path, path.name, markup=markup)
+    else:
+        tg.send(f'{path.name} is {size / 1e6:.0f} MB, too big for Telegram. Making a smaller copy...')
+        try:
+            small = shrink_for_telegram(path)
+        except Exception as e:  # noqa: BLE001
+            return tg.send(f'Could not shrink {path.name} ({type(e).__name__}). The full clip is on the laptop in output/clips.')
+        try:
+            tg.send_video(small, path.name, markup=markup)
+        finally:
+            small.unlink(missing_ok=True)
     try:
-        small = shrink_for_telegram(path)
+        cap = make_caption(path, CURRENT_STATE)
+        tg.send_all(f'YOUTUBE TITLE:\n{cap["title"]}\n\nDESCRIPTION:\n{cap["description"]}\n\nINSTAGRAM CAPTION:\n{cap["ig"]}')
     except Exception as e:  # noqa: BLE001
-        return tg.send(f'Could not shrink {path.name} ({type(e).__name__}). The full clip is on the laptop in output/clips.')
-    try:
-        tg.send_video(small, path.name)
-    finally:
-        small.unlink(missing_ok=True)
+        tg.send_all(f'(could not write a caption: {type(e).__name__})')
 
 
 def code_version():
@@ -657,6 +780,7 @@ def keep_awake():
 
 
 def main():
+    global CURRENT_STATE
     load_env()
     token, chat = os.environ.get('BOT_TOKEN'), os.environ.get('CHAT_ID')
     if not token:
@@ -665,6 +789,7 @@ def main():
     tg = Telegram(token, chat)
     state = load_state()
     m = Manager(tg, state)
+    CURRENT_STATE = state
     tg.viewers = [str(v) for v in state['viewers']]
     keep_awake()
     kill_leftover(state)
@@ -694,6 +819,12 @@ def loop(tg, m, chat, offset):
             continue
         for u in updates:
             offset = u['update_id'] + 1
+            if u.get('callback_query'):
+                try:
+                    handle_callback(tg, m, u['callback_query'])
+                except Exception as e:  # noqa: BLE001
+                    log(f'callback error: {type(e).__name__}')
+                continue
             msg = u.get('message') or {}
             text, cid = msg.get('text') or '', str((msg.get('chat') or {}).get('id', ''))
             if not text:

@@ -100,3 +100,14 @@ Clips are encoded at most 8 Mbit/s (about 31 MB for 30 s). A clip over 48 MB is 
 The owner (the chat in `CHAT_ID`) can run `/addfriend CHATID`. A friend first sends `/start` and `/id` to the bot to learn their chat id. Friends then receive every clip and the "LIVE now" notices, and may use `/status`, `/clips` and `/disk`. Everything else (`/watch`, `/waitfor`, `/stop`, `/set`, `/update`, `/clean`, `/addfriend`...) stays owner-only. `/friends` lists them and `/removefriend CHATID` removes one.
 
 `/addadmin CHATID` gives a trusted person every command except adding or removing people (`/addfriend`, `/addadmin`, `/removefriend`, `/removeadmin`, `/friends` stay owner-only, so an admin can neither lock the owner out nor add others). `/removeadmin CHATID` demotes them to a friend. `/update` can only pull from the repo and branch configured on the laptop, and `/set` values are validated, so chat commands cannot run arbitrary code or read `bot.env`.
+
+## Auto captions and one-tap YouTube upload
+
+After every clip the bot sends a ready-to-paste YouTube title, description (with credit) and Instagram caption, written from what Whisper heard (swear words are masked in the title). `/set topic GTA_6` changes the topic used in the title and hashtags (`_` becomes a space).
+
+If `yt_token.json` exists, each clip also carries a **⬆ YouTube (Private)** button (owner and admins only). One-time setup:
+1. Google Cloud -> *OAuth consent screen*: External, status **Testing**, add the Google account that owns the channel as a **test user**.
+2. *Credentials -> Create credentials -> OAuth client ID -> Desktop app*, download the JSON, save it as `client_secret.json` next to `bot.py`.
+3. On the laptop: `python yt_auth.py`, sign in with the channel account, allow "upload videos".
+
+Limits you cannot code around: uploads from unaudited API projects are forced to **Private** (you make them public in Studio), and one upload costs about 1,600 of the 10,000 daily quota units (the chat polling uses the same quota), so the bot allows 5 uploads a day. `client_secret.json` and `yt_token.json` are secrets and are git-ignored.
