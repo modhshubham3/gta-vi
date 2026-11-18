@@ -666,14 +666,79 @@ def make_caption(path, state):
             f'🎬 Source: {who}{src}\n'
             f'Fan clip, no copyright intended. Credit ya removal ke liye DM karo.\n\n'
             f'{yt_tags}')
-    ig_hook = hook or (f'{label} {emo}' if label else 'Chat went wild')
-    ig = (f'{ig_hook} {emo}🔥\n'
+    ig_hook = hook or label or 'Chat went wild'
+    ig = (f'{ig_hook} {emo}{e2}\n'
           f'{topic} Launch Day moment 😱 Aapko kaisa laga? Comment karo 👇\n'
           f'Follow karo roz ke {topic} clips ke liye 🎮\n'
           f'Credit: {who}\n\n'
           f'{ig_tags}')
     tags_list = [topic, 'GTA VI', 'GTA 6 gameplay', 'GTA 6 launch day', label or 'GTA 6 reaction', 'Shorts', 'Gaming']
-    return {'title': title, 'description': desc, 'ig': ig, 'tags': tags_list}
+    q = f'{label} ka ye scene aapko kaisa laga? 1 se 10 rating do 👇🔥' if label else f'{topic} Launch Day ka ye moment aapko kaisa laga? Comment karo 👇🔥'
+    comment = f'{q}\nRoz ke {topic} clips ke liye follow/subscribe karo 🎮'
+    replies = ['Thanks bhai 🔥 aur clips ke liye follow karo!', 'Agla clip isse bhi crazy hoga, bane raho 😎', 'Source stream ka link description me hai 🎮 Credit unhi ko']
+    return {'title': title, 'description': desc, 'ig': ig, 'tags': tags_list, 'comment': comment, 'replies': replies}
+
+
+def clip_quality(path):
+    """Look at the finished clip: how much of it is black, and is there any sound. Never raises."""
+    info = {'black': 0.0, 'silent': False}
+    try:
+        dur = float(subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', str(path)],
+                                   capture_output=True, text=True, timeout=30).stdout.strip() or 0)
+        p = subprocess.run(['ffmpeg', '-hide_banner', '-nostats', '-i', str(path), '-vf', 'blackdetect=d=0.4:pic_th=0.95:pix_th=0.12',
+                            '-af', 'volumedetect', '-f', 'null', '-'], capture_output=True, text=True, timeout=120)
+        blk = sum(float(x) for x in re.findall(r'black_duration:([\d.]+)', p.stderr))
+        info['black'] = min(1.0, blk / dur) if dur else 0.0
+        m = re.search(r'mean_volume:\s*(-?[\d.]+) dB', p.stderr)
+        info['silent'] = bool(m) and float(m.group(1)) < -55
+    except Exception:  # noqa: BLE001
+        pass
+    return info
+
+
+def spike_ratio(path):
+    """How big the chat spike was behind this clip (from clips/spikes.csv), or None for a manual /clipnow clip."""
+    try:
+        for line in (CLIPS / 'spikes.csv').read_text(encoding='utf-8').splitlines():
+            parts = line.split(',')
+            if len(parts) >= 4 and parts[3].strip() == path.name:
+                return int(parts[1]) / max(float(parts[2]), 1.0)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def score_clip(path, info, cap):
+    """1-10 and a plain-words verdict, so you can decide in two seconds."""
+    sc, why = 5, []
+    ratio = spike_ratio(path)
+    if ratio is not None:
+        if ratio >= 3:
+            sc += 2
+        elif ratio >= 2:
+            sc += 1
+        why.append(f'chat spike {ratio:.1f}x')
+    else:
+        sc += 1
+        why.append('picked by you')
+    transcript = read_transcript(path)
+    if len(transcript.split()) >= 6:
+        sc += 1
+        why.append('clear speech')
+    else:
+        sc -= 1
+        why.append('little speech')
+    if cap.get('title') and not any(w in cap['title'] for w in ('chat ka reaction', 'Chat went wild')):
+        sc += 1
+    if info.get('black', 0) > 0.3:
+        sc -= 3
+        why.append('mostly dark')
+    if info.get('silent'):
+        sc -= 2
+        why.append('no sound')
+    sc = max(1, min(10, sc))
+    verdict = 'POST NOW 🔥' if sc >= 7 else ('okay, post if nothing better' if sc >= 5 else 'skip it, weak')
+    return sc, f'{verdict} ({", ".join(why)})'
 
 
 def clip_markup(path, cap):
@@ -743,7 +808,7 @@ def handle_callback(tg, m, cb):
     threading.Thread(target=do_upload, args=(tg, state, name, replier), daemon=True).start()
 
 
-def send_clip(tg, path):
+def send_clip(tg, path, info=None):
     size = path.stat().st_size
     try:
         cap = make_caption(path, CURRENT_STATE)
@@ -765,9 +830,15 @@ def send_clip(tg, path):
     try:
         import html as H
         pre = lambda s: '<pre>' + H.escape(s) + '</pre>'  # Telegram: tap a code block to copy all of it
-        tg.send_all('<b>YOUTUBE TITLE</b> (tap to copy)\n' + pre(cap['title']) +
+        head = ''
+        if cap:
+            sc, verdict = score_clip(path, info or {}, cap)
+            head = f'<b>⭐ {sc}/10, {H.escape(verdict)}</b>\n\n'
+        tg.send_all(head + '<b>YOUTUBE TITLE</b> (tap to copy)\n' + pre(cap['title']) +
                     '\n<b>YOUTUBE DESCRIPTION</b> (tap to copy)\n' + pre(cap['description']) +
-                    '\n<b>INSTAGRAM CAPTION</b> (tap to copy)\n' + pre(cap['ig']), html=True)
+                    '\n<b>INSTAGRAM CAPTION</b> (tap to copy)\n' + pre(cap['ig']) +
+                    '\n<b>FIRST COMMENT, post and pin it</b>\n' + pre(cap['comment']) +
+                    '\n<b>REPLIES for comments</b>\n' + pre('\n'.join(cap['replies'])), html=True)
     except Exception as e:  # noqa: BLE001
         tg.send_all(f'(could not write a caption: {type(e).__name__})')
 
@@ -869,7 +940,11 @@ def clip_sender(tg, state):
         for p in sorted(CLIPS.glob('*.mp4'), key=lambda p: p.stat().st_mtime):
             if p.name in sent or '.raw.' in p.name or '.tmp.' in p.name or time.time() - p.stat().st_mtime < 10:
                 continue
-            send_clip(tg, p)
+            info = clip_quality(p)
+            if info['black'] > 0.6:
+                tg.send(f'Skipped {p.name}: it is mostly black. (/clips can still send it.)')
+            else:
+                send_clip(tg, p, info)
             sent.add(p.name)
             state['sent'] = sorted(sent)
             save_state(state)
