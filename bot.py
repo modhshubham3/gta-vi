@@ -393,6 +393,7 @@ Tap the ⬆ button under a clip to upload it to YouTube as Private (owner and ad
 /restart   restart with the current settings
 /update   download the latest code from GitHub and restart
 /rollback   undo the last /update
+/ytauth   connect your YouTube channel for the upload button (sign-in from your phone)
 /addfriend CHATID   let a friend receive clips and see status (they send /start and /id first)
 /addadmin CHATID   same, plus every command except adding or removing people
 /removefriend CHATID   remove a friend
@@ -408,7 +409,7 @@ FRIEND_HELP = '''You can receive the clips here and use:
 Only the owner can start, stop or change things.'''
 
 
-OWNER_ONLY = ('/addfriend', '/removefriend', '/addadmin', '/removeadmin', '/friends')
+OWNER_ONLY = ('/ytauth', '/ytcode', '/addfriend', '/removefriend', '/addadmin', '/removeadmin', '/friends')
 
 
 def handle(m, tg, text, role='owner'):
@@ -420,6 +421,10 @@ def handle(m, tg, text, role='owner'):
         return tg.send('Only the owner can do that.')
     if cmd in ('/start', '/help'):
         tg.send(FRIEND_HELP if role == 'friend' else HELP)
+    elif cmd == '/ytauth':
+        yt_auth_start(tg)
+    elif cmd == '/ytcode':
+        yt_auth_finish(tg, args[0] if args else '')
     elif cmd == '/addfriend':
         if len(args) != 1 or not re.fullmatch(r'-?\d{5,15}', args[0]):
             return tg.send('Usage: /addfriend CHATID (your friend sends /id to this bot to get it, and must send /start first)')
@@ -574,6 +579,41 @@ def make_caption(path, state):
     desc = f'{hook}\n\nCredit: {who}{src}\nFan clip, no copyright intended. DM for removal.\n\n{tags}'
     ig = f'{hook} 🔥\nCredit: {who}\n{tags} #Reels'
     return {'title': title, 'description': desc, 'ig': ig, 'tags': [topic, tag, 'Shorts', 'Gaming']}
+
+
+PENDING_AUTH = {}
+
+
+def yt_auth_start(tg):
+    secret = HERE / 'client_secret.json'
+    if not secret.exists():
+        return tg.send('client_secret.json is not on the laptop yet.')
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    flow = InstalledAppFlow.from_client_secrets_file(str(secret), ['https://www.googleapis.com/auth/youtube.upload'])
+    flow.redirect_uri = 'http://localhost:8080/'
+    url, _ = flow.authorization_url(prompt='consent', access_type='offline')
+    PENDING_AUTH['flow'], PENDING_AUTH['t'] = flow, time.time()
+    tg.send('YouTube sign-in, on your phone:\n1) Long-press the NEXT message and choose Copy. Do not tap the link: Telegram opens it in its own browser and Google refuses that.\n'
+            '2) Open the Chrome app, paste, sign in with the channel account, Advanced > Go to Clip Uploader > Allow.\n'
+            '3) You land on a page that says it cannot be reached. That is expected. Tap the address bar, copy the whole address (starts with http://localhost:8080/?state=...).\n'
+            '4) Send it here as:  /ytcode  <paste the address>\nYou have 15 minutes.')
+    tg.send(url)
+
+
+def yt_auth_finish(tg, address):
+    flow = PENDING_AUTH.get('flow')
+    if not flow or time.time() - PENDING_AUTH.get('t', 0) > 900:
+        return tg.send('No sign-in in progress (or it expired). Send /ytauth first.')
+    if not address.startswith('http://localhost'):
+        return tg.send('That is not the right address. It must start with http://localhost:8080/?state=...')
+    os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'  # the redirect is http://localhost, on purpose
+    try:
+        flow.fetch_token(authorization_response=address)
+    except Exception as e:  # noqa: BLE001
+        return tg.send(f'Sign-in failed ({type(e).__name__}). Send /ytauth for a fresh link and try again.')
+    YT_TOKEN.write_text(flow.credentials.to_json())
+    PENDING_AUTH.clear()
+    tg.send('YouTube is connected. New clips now have the ⬆ YouTube (Private) button. You can delete the message with the address.')
 
 
 def yt_markup(path):
