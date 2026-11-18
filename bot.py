@@ -397,7 +397,7 @@ HELP = '''/watch LINK   start (YouTube live link or Twitch channel name/link)
 /status   what is happening now
 /clips [n]   send the last n clips (default 1)
 /disk   free disk space
-/clean   delete finished recordings to free space
+/clean   delete finished recordings to free space\n/clearclips [hours]   delete old clips (default: older than 1 hour)
 Tap the ⬆ button under a clip to upload it to YouTube as Private (owner and admins)
 /settings   show settings
 /set NAME VALUE   change a setting, then /restart
@@ -516,6 +516,8 @@ def handle(m, tg, text, role='owner'):
             except Exception:  # noqa: BLE001
                 pass
         tg.send(f'Deleted {len(recs)} recordings, freed {freed / 1e9:.2f} GB. Free now: {free_gb():.1f} GB')
+    elif cmd == '/clearclips':
+        clear_clips(tg, int(args[0]) if args and args[0].isdigit() else 1)
     elif cmd == '/clips':
         n = min(int(args[0]), 5) if args and args[0].isdigit() else 1
         files = sorted(CLIPS.glob('*.mp4'), key=lambda p: p.stat().st_mtime)[-n:] if CLIPS.exists() else []
@@ -761,6 +763,25 @@ def clip_now(tg, m, back):
     p = subprocess.run(cmd, capture_output=True, text=True, cwd=HERE)
     if p.returncode != 0:
         tg.send('Cutting failed: ' + (p.stderr or p.stdout)[-200:])
+
+
+def clear_clips(tg, hours=1):
+    """Delete finished clips (and their caption files) older than `hours`. Never touches a clip still being made."""
+    if not CLIPS.exists():
+        return tg.send('No clips folder yet.')
+    limit = time.time() - hours * 3600
+    n, freed = 0, 0
+    for p in list(CLIPS.glob('*.mp4')) + list(CLIPS.glob('*.srt')) + list((CLIPS / 'captions').glob('*.srt')):
+        if '.raw.' in p.name or '.tmp.' in p.name:
+            continue
+        try:
+            if p.stat().st_mtime < limit:
+                freed += p.stat().st_size
+                p.unlink()
+                n += 1
+        except OSError:
+            pass
+    tg.send(f'Deleted {n} old files ({freed / 1e6:.0f} MB). Clips newer than {hours} h were kept.')
 
 
 def code_version():
