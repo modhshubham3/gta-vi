@@ -413,6 +413,9 @@ OWNER_ONLY = ('/ytauth', '/ytcode', '/addfriend', '/removefriend', '/addadmin', 
 
 
 def handle(m, tg, text, role='owner'):
+    shared = re.search(r'http://localhost:\d+/\S+', text)
+    if shared and role == 'owner':  # the address shared straight from the browser's Share button
+        return yt_auth_finish(tg, shared.group(0))
     parts = text.strip().split()
     cmd = parts[0].lower().split('@')[0]
     args = parts[1:]
@@ -593,10 +596,12 @@ def yt_auth_start(tg):
     flow.redirect_uri = 'http://localhost:8080/'
     url, _ = flow.authorization_url(prompt='consent', access_type='offline')
     PENDING_AUTH['flow'], PENDING_AUTH['t'] = flow, time.time()
-    tg.send('YouTube sign-in, on your phone:\n1) Long-press the NEXT message and choose Copy. Do not tap the link: Telegram opens it in its own browser and Google refuses that.\n'
-            '2) Open the Chrome app, paste, sign in with the channel account, Advanced > Go to Clip Uploader > Allow.\n'
-            '3) You land on a page that says it cannot be reached. That is expected. Tap the address bar, copy the whole address (starts with http://localhost:8080/?state=...).\n'
-            '4) Send it here as:  /ytcode  <paste the address>\nYou have 15 minutes.')
+    tg.send('YouTube sign-in, on your phone:\n'
+            '1) Tap the link in the NEXT message.\n'
+            '2) Sign in with the channel account. Tap Continue (not Back to safety), then Continue or Allow.\n'
+            '3) You reach a page that says "This site can\'t be reached". That is correct.\n'
+            '4) Tap the Share icon at the top right, choose Telegram, choose this bot, tap Send. Nothing else to do.\n'
+            'You have 15 minutes. (If the link will not open, long-press it, Copy, paste it in Chrome.)')
     tg.send(url)
 
 
