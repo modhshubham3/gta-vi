@@ -44,9 +44,9 @@ BACKUP = HERE / 'backup'
 TG_LIMIT = 48 * 1024 * 1024  # Telegram bots can upload up to 50 MB
 
 DEFAULTS = {'ratio': 2.5, 'min_msgs': 20, 'window': 10.0, 'quality': '720p60', 'model': 'tiny',
-            'api_poll': 10.0, 'gap': 60.0, 'length': 30.0, 'before': 15.0, 'captions': True, 'verbose': True, 'topic': 'GTA_6'}
+            'api_poll': 10.0, 'gap': 60.0, 'length': 30.0, 'before': 15.0, 'captions': True, 'verbose': True, 'topic': 'GTA_6', 'crop': False}
 KINDS = {'ratio': float, 'min_msgs': int, 'window': float, 'quality': str, 'model': str,
-         'api_poll': float, 'gap': float, 'length': float, 'before': float, 'captions': bool, 'verbose': bool, 'topic': str}
+         'api_poll': float, 'gap': float, 'length': float, 'before': float, 'captions': bool, 'verbose': bool, 'topic': str, 'crop': bool}
 FLAGS = {'ratio': '--ratio', 'min_msgs': '--min-msgs', 'window': '--window', 'quality': '--quality',
          'model': '--model', 'api_poll': '--api-poll', 'gap': '--gap', 'length': '--length', 'before': '--before'}
 
@@ -196,6 +196,8 @@ def build_cmd(url, s):
         cmd.append('--no-captions')
     if s['verbose']:  # log every 10 s chat count so /status shows what chat is doing
         cmd.append('--verbose')
+    if s.get('crop'):  # fill the whole vertical frame instead of a small band over a blurred background
+        cmd.append('--crop')
     return cmd
 
 
@@ -753,6 +755,8 @@ def clip_now(tg, m, back):
            '--length', str(back + 5), '--model', str(s['model']), '--out', str(OUT)]
     if not s['captions']:
         cmd.append('--no-captions')
+    if s.get('crop'):
+        cmd.append('--crop')
     tg.send(f'Cutting the last {back} s. It arrives in a minute or two.')
     p = subprocess.run(cmd, capture_output=True, text=True, cwd=HERE)
     if p.returncode != 0:
