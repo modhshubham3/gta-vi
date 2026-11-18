@@ -66,6 +66,7 @@ class Telegram:
     def __init__(self, token, chat_id):
         base = os.environ.get('TELEGRAM_API_BASE', 'https://api.telegram.org')
         self.url, self.chat_id, self.http = f'{base}/bot{token}/', chat_id, requests.Session()
+        self.viewers = []
 
     def call(self, method, http_timeout=40, files=None, **params):
         try:
@@ -80,10 +81,36 @@ class Telegram:
         for i in range(0, max(len(text), 1), 4000):
             self.call('sendMessage', chat_id=chat_id or self.chat_id, text=text[i:i + 4000])
 
+    def send_video(self, path, caption='', only=None):
+        """Send a clip to the owner and every friend (or just `only`). It is uploaded once; the others get it by file_id."""
+        targets = [only] if only else [self.chat_id] + list(self.viewers)
+        file_id = None
+        for t in targets:
+            if file_id:
+                self.call('sendVideo', chat_id=t, video=file_id, caption=caption[:900])
+                continue
+            with open(path, 'rb') as f:
+                r = self.call('sendVideo', http_timeout=300, files={'video': f}, chat_id=t,
+                              caption=caption[:900], supports_streaming='true', width=1080, height=1920)
+            if isinstance(r, dict):
+                file_id = (r.get('video') or {}).get('file_id')
+
+    def broadcast(self, text):
+        for t in [self.chat_id] + list(self.viewers):
+            self.send(text, chat_id=t)
+
+
+class Replier:
+    """Answers one specific chat, so a friend's /status goes to the friend and not to the owner."""
+
+    def __init__(self, tg, cid):
+        self.tg, self.cid = tg, cid
+
+    def send(self, text, chat_id=None):
+        self.tg.send(text, chat_id=self.cid)
+
     def send_video(self, path, caption=''):
-        with open(path, 'rb') as f:
-            return self.call('sendVideo', http_timeout=300, files={'video': f}, chat_id=self.chat_id,
-                             caption=caption[:900], supports_streaming='true', width=1080, height=1920)
+        self.tg.send_video(path, caption, only=self.cid)
 
 
 # ---------- State ----------
@@ -98,6 +125,7 @@ def load_state():
     s.setdefault('url', None)
     s.setdefault('desired', False)
     s.setdefault('channel', None)
+    s.setdefault('viewers', [])
     return s
 
 
@@ -262,12 +290,12 @@ class Manager:
                     self.stop_process()
                     self.state['url'] = None
                     save_state(self.state)
-                    self.tg.send('The stream ended. Waiting for the next live on this channel.')
+                    self.tg.broadcast('The stream ended. Waiting for the next live on this channel.')
             return
         info = probe_live(ch)
         if info:
             url = f'https://www.youtube.com/watch?v={info["id"]}'
-            self.tg.send(f'LIVE now: {info["title"][:80]}\nRecording and clipping {url}')
+            self.tg.broadcast(f'LIVE now: {info["title"][:80]}\nRecording and clipping {url}')
             self.start(url)
 
     def supervise(self):
@@ -347,16 +375,45 @@ HELP = '''/watch LINK   start (YouTube live link or Twitch channel name/link)
 /restart   restart with the current settings
 /update   download the latest code from GitHub and restart
 /rollback   undo the last /update
+/addfriend CHATID   let a friend receive clips (they send /id to the bot first)
+/removefriend CHATID   remove a friend
+/friends   list friends
 /id   show your chat id'''
 
 
-def handle(m, tg, text):
+FRIEND_CMDS = ('/start', '/help', '/status', '/clips', '/disk')
+FRIEND_HELP = '''You can receive the clips here and use:
+/status   what is happening now
+/clips [n]   send the last n clips (default 1)
+/disk   free disk space
+Only the owner can start, stop or change things.'''
+
+
+def handle(m, tg, text, owner=True):
     parts = text.strip().split()
     cmd = parts[0].lower().split('@')[0]
     args = parts[1:]
     s = m.state
+    if not owner and cmd not in FRIEND_CMDS:
+        return tg.send('Only the owner can do that.')
     if cmd in ('/start', '/help'):
-        tg.send(HELP)
+        tg.send(HELP if owner else FRIEND_HELP)
+    elif cmd == '/addfriend':
+        if len(args) != 1 or not re.fullmatch(r'-?\d{5,15}', args[0]):
+            return tg.send('Usage: /addfriend CHATID (your friend sends /id to this bot to get it, and must send /start first)')
+        if args[0] not in s['viewers']:
+            s['viewers'].append(args[0])
+            save_state(s)
+        tg.viewers = list(s['viewers'])
+        tg.send(f'Added {args[0]}. They now get every clip and can use /status, /clips, /disk.')
+        tg.send('You were added to receive clips. Send /help to see what you can do.', chat_id=args[0])
+    elif cmd == '/removefriend':
+        s['viewers'] = [v for v in s['viewers'] if v not in args]
+        save_state(s)
+        tg.viewers = list(s['viewers'])
+        tg.send('Removed.')
+    elif cmd == '/friends':
+        tg.send('Friends: ' + (', '.join(s['viewers']) or 'none'))
     elif cmd == '/watch':
         if not args:
             return tg.send('Usage: /watch LINK')
@@ -588,6 +645,7 @@ def main():
     tg = Telegram(token, chat)
     state = load_state()
     m = Manager(tg, state)
+    tg.viewers = [str(v) for v in state['viewers']]
     keep_awake()
     kill_leftover(state)
     for fn, a in ((m.supervise, ()), (clip_sender, (tg, state)), (disk_watch, (tg,))):
@@ -627,6 +685,11 @@ def loop(tg, m, chat, offset):
                     handle(m, tg, text)
                 except Exception as e:  # noqa: BLE001 - one bad command must never kill the bot
                     tg.send(f'Error: {type(e).__name__}')
+            elif cid in [str(v) for v in m.state['viewers']]:
+                try:
+                    handle(m, Replier(tg, cid), text, owner=False)
+                except Exception as e:  # noqa: BLE001
+                    tg.send(f'Error: {type(e).__name__}', chat_id=cid)
             # anyone else is ignored
 
 

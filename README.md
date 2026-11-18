@@ -94,3 +94,7 @@ Clips are encoded at most 8 Mbit/s (about 31 MB for 30 s). A clip over 48 MB is 
 ## Waiting for a channel to go live
 
 `/waitfor @channelhandle` makes the bot poll `https://www.youtube.com/@channelhandle/live` with Streamlink every 45 s (no API quota). When the channel goes live it starts recording and clipping that stream, tells you on Telegram, and when the stream ends it goes back to waiting. One stream at a time: a laptop cannot render clips for several streams.
+
+## Friends (receive clips, no control)
+
+The owner (the chat in `CHAT_ID`) can run `/addfriend CHATID`. A friend first sends `/start` and `/id` to the bot to learn their chat id. Friends then receive every clip and the "LIVE now" notices, and may use `/status`, `/clips` and `/disk`. Everything else (`/watch`, `/waitfor`, `/stop`, `/set`, `/update`, `/clean`, `/addfriend`...) stays owner-only. `/friends` lists them and `/removefriend CHATID` removes one.
