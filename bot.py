@@ -81,9 +81,10 @@ class Telegram:
             log(f'telegram {method} failed: {type(e).__name__}')
             return None
 
-    def send(self, text, chat_id=None):
+    def send(self, text, chat_id=None, html=False):
         for i in range(0, max(len(text), 1), 4000):
-            self.call('sendMessage', chat_id=chat_id or self.chat_id, text=text[i:i + 4000])
+            extra = {'parse_mode': 'HTML'} if html else {}
+            self.call('sendMessage', chat_id=chat_id or self.chat_id, text=text[i:i + 4000], **extra)
 
     def send_video(self, path, caption='', only=None, markup=None):
         """Send a clip to the owner and every friend (or just `only`). It is uploaded once; the others get it by file_id."""
@@ -100,9 +101,9 @@ class Telegram:
             if isinstance(r, dict):
                 file_id = (r.get('video') or {}).get('file_id')
 
-    def send_all(self, text, only=None):
+    def send_all(self, text, only=None, html=False):
         for t in ([only] if only else [self.chat_id] + list(self.viewers)):
-            self.send(text, chat_id=t)
+            self.send(text, chat_id=t, html=html)
 
     def broadcast(self, text):
         for t in [self.chat_id] + list(self.viewers):
@@ -121,8 +122,8 @@ class Replier:
     def send_video(self, path, caption='', markup=None):
         self.tg.send_video(path, caption, only=self.cid, markup=markup)
 
-    def send_all(self, text):
-        self.tg.send(text, chat_id=self.cid)
+    def send_all(self, text, html=False):
+        self.tg.send(text, chat_id=self.cid, html=html)
 
 
 # ---------- State ----------
@@ -586,71 +587,101 @@ def clean_text(text):
     return re.sub(r'(?i)\b\w*(' + '|'.join(BAD_WORDS) + r')\w*\b', mask, text)
 
 
+KEYWORDS = [  # (words to look for, emoji, label shown in the title, extra hashtags)
+    (('police', 'cop', 'cops', 'wanted', 'arrest', 'chase'), '🚓', 'Police Chase', ['GTA6Police', 'GTA6Chase']),
+    (('heist', 'rob', 'robbery', 'bank', 'money', 'cash', 'steal'), '💰', 'Heist Moment', ['GTA6Heist']),
+    (('shotgun', 'gun', 'shoot', 'weapon', 'bullet', 'longarm', 'rifle'), '🔫', 'Weapons', ['GTA6Weapons']),
+    (('jason',), '🕶️', 'Jason', ['Jason', 'GTA6Jason']),
+    (('lucia',), '👩', 'Lucia', ['Lucia', 'GTA6Lucia']),
+    (('vice city', 'miami', 'beach', 'leonida', 'florida', 'keys'), '🌴', 'Vice City', ['Leonida', 'GTA6ViceCity']),
+    (('car', 'drive', 'driving', 'race', 'speed', 'engine'), '🏎️', 'Car Moment', ['GTA6Cars']),
+    (('bike', 'motorcycle', 'helicopter', 'plane', 'boat', 'jet'), '🏍️', 'Ride', ['GTA6Vehicles']),
+    (('fight', 'punch', 'kill', 'dead', 'die', 'explosion', 'blast'), '💥', 'Action Scene', ['GTA6Action']),
+    (('funny', 'lol', 'haha', 'laugh', 'joke'), '😂', 'Funny Moment', ['GTA6Funny']),
+    (('wow', 'no way', 'oh my god', 'omg', 'insane', 'crazy', 'unbelievable', 'what the'), '😱', 'Reaction', ['GTA6Reaction']),
+]
+CORE_TAGS = ['GTA6', 'Shorts', 'GTAVI', 'GrandTheftAutoVI', 'GTA6Gameplay', 'GTA6Launch', 'GTA6Release', 'ViceCity', 'Rockstar', 'Gaming']
+STOP = {'it', "it's", 'the', 'a', 'an', 'and', 'but', 'so', 'no', 'i', "i'm", 'to', 'of', 'is', 'in', 'on', 'that', 'this', 'you', 'we', 'was',
+        'with', 'for', 'or', 'oh', 'um', 'uh', 'he', 'she', 'they', 'me', 'my', 'at', 'be', 'are', 'do', 'if', 'what', 'just',
+        'before', 'after', 'because', 'when', 'while', 'then', 'than', 'there', 'here', 'out', 'up', 'from', 'about', 'into'}
+
+
+def cut_words(text, limit):
+    """Longest start of `text` that fits `limit` characters, ending on a whole word."""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(' ', 1)[0].rstrip(' ,.-:;')
+
+
 def make_caption(path, state):
+    import random
+    rng = random.Random(path.name)  # same clip -> same text, different clips -> different wording
     topic = state['settings'].get('topic', 'GTA_6').replace('_', ' ')
     tag = re.sub(r'\W', '', topic) or 'Clips'
-    words = clean_text(read_transcript(path)).split()
-    weak = {'it', "it's", 'the', 'a', 'an', 'and', 'but', 'so', 'no', 'i', "i'm", 'to', 'of', 'is', 'in', 'on', 'that', 'this', 'you', 'we', 'was', 'with', 'for', 'or', 'oh', 'um', 'uh'}
-    head = words[:8]
-    while head and head[-1].lower().strip(' ,.!?-') in weak:
-        head.pop()  # do not end a title on a dangling word
-    hook = ' '.join(head).strip(' ,.-').capitalize() if head else 'Chat went wild'
-    title = f'{hook} | {topic}'[:95]
+    raw = clean_text(read_transcript(path))
+    low = raw.lower()
+    words = raw.split()
+    first = re.split(r'(?<=[.!?])\s+', raw.strip())[0] if raw.strip() else ''
+    head = (first.split() if len(first.split()) >= 3 else words)[:8]
+    while head and head[-1].lower().strip(' ,.!?-') in STOP:
+        head.pop()
+    meaningful = [w for w in head if w.lower().strip(' ,.!?-') not in STOP]
+    hook = ' '.join(head).strip(' ,.-').capitalize() if len(meaningful) >= 3 else ''
+    hook = re.sub(r'([.!?]\s+)([a-z])', lambda m: m.group(1) + m.group(2).upper(), hook)
+    if '*' in hook:  # a masked swear word makes a poor, risky title: use a clean one
+        hook = ''
+    emo, label, extra = '🔥', '', []
+    for keys, e, lab, tags in KEYWORDS:
+        if any(k in low for k in keys):
+            emo, label, extra = e, lab, tags
+            break
+    e2 = '🔥' if emo == '😱' else '😱'
+    # ----- title: hook + emojis + what it is + launch day angle
+    if hook and label:
+        opts = [f'{hook} {emo}{e2} | GTA 6 {label}', f'GTA 6 Day 1: {label} {emo} {hook}', f'{hook}?! {emo}{e2} {topic} Launch Day']
+    elif hook:
+        opts = [f'{hook} 😱🔥 | {topic} Launch Day', f'{topic} Day 1 😱 {hook}', f'{hook}?! 🤯 {topic}']
+    elif label:
+        opts = [f'{topic} {label} {emo}{e2} Launch Day Moment', f'Ye {topic} {label} dekha? {emo}{e2}', f'{topic} Day 1: {label} {emo} Crazy!']
+    else:
+        opts = [f'{topic} Launch Day pe chat ka reaction 😱🔥', f'Chat went wild 🔥 {topic} Day 1 moment 😱', f'{topic} Launch Day: dekho kya hua 😳🔥']
+    title = cut_words(rng.choice(opts), 95)
+    # ----- hashtags (YouTube shows the first three above the title)
+    tags_all = []
+    for t in [CORE_TAGS[0], CORE_TAGS[1], CORE_TAGS[2]] + extra + CORE_TAGS[3:]:
+        if t not in tags_all:
+            tags_all.append(t)
+    yt_tags = ' '.join('#' + t for t in tags_all[:12])
+    ig_tags = ' '.join('#' + t for t in [t for t in tags_all if t != 'Shorts'][:8]) + ' #Reels'
     credit = state.get('credit') or {}
     who = credit.get('author') or '(add the streamer name)'
     src = f' ({credit["url"]})' if credit.get('url') else ''
-    tags = f'#{tag} #Shorts #Gaming'
-    desc = f'{hook}\n\nCredit: {who}{src}\nFan clip, no copyright intended. DM for removal.\n\n{tags}'
-    ig = f'{hook} 🔥\nCredit: {who}\n{tags} #Reels'
-    desc_copy = f'{hook}\n\nCredit: {who}\nFan clip. DM for removal.\n{tags}'
-    return {'title': title, 'description': desc, 'desc_copy': desc_copy, 'ig': ig, 'tags': [topic, tag, 'Shorts', 'Gaming']}
-
-
-PENDING_AUTH = {}
-
-
-def yt_auth_start(tg):
-    secret = HERE / 'client_secret.json'
-    if not secret.exists():
-        return tg.send('client_secret.json is not on the laptop yet.')
-    from google_auth_oauthlib.flow import InstalledAppFlow
-    flow = InstalledAppFlow.from_client_secrets_file(str(secret), ['https://www.googleapis.com/auth/youtube.upload'])
-    flow.redirect_uri = 'http://localhost:8080/'
-    url, _ = flow.authorization_url(prompt='consent', access_type='offline')
-    PENDING_AUTH['flow'], PENDING_AUTH['t'] = flow, time.time()
-    tg.send('YouTube sign-in, on your phone:\n'
-            '1) Tap the link in the NEXT message.\n'
-            '2) Sign in with the channel account. Tap Continue (not Back to safety), then Continue or Allow.\n'
-            '3) You reach a page that says "This site can\'t be reached". That is correct.\n'
-            '4) Tap the Share icon at the top right, choose Telegram, choose this bot, tap Send. Nothing else to do.\n'
-            'You have 15 minutes. (If the link will not open, long-press it, Copy, paste it in Chrome.)')
-    tg.send(url)
-
-
-def yt_auth_finish(tg, address):
-    flow = PENDING_AUTH.get('flow')
-    if not flow or time.time() - PENDING_AUTH.get('t', 0) > 900:
-        return tg.send('No sign-in in progress (or it expired). Send /ytauth first.')
-    if not address.startswith('http://localhost'):
-        return tg.send('That is not the right address. It must start with http://localhost:8080/?state=...')
-    os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'  # the redirect is http://localhost, on purpose
-    try:
-        flow.fetch_token(authorization_response=address)
-    except Exception as e:  # noqa: BLE001
-        return tg.send(f'Sign-in failed ({type(e).__name__}). Send /ytauth for a fresh link and try again.')
-    YT_TOKEN.write_text(flow.credentials.to_json())
-    PENDING_AUTH.clear()
-    tg.send('YouTube is connected. New clips now have the ⬆ YouTube (Private) button. You can delete the message with the address.')
+    quote = f'🎙️ Moment: "{cut_words(raw, 120)}"\n' if len(meaningful) >= 3 else ''
+    what = f'{emo} {label}\n' if label else ''
+    desc = (f'{title}\n\n'
+            f'{topic} Launch Day ka ek aur crazy moment! 🔥😱 Aapko kaisa laga? Comment karke batao 👇\n\n'
+            f'{what}{quote}'
+            f'👍 Like karo • 🔔 Subscribe karo roz ke {topic} clips aur reactions ke liye • 💬 Apna reaction comment me likho\n\n'
+            f'🎬 Source: {who}{src}\n'
+            f'Fan clip, no copyright intended. Credit ya removal ke liye DM karo.\n\n'
+            f'{yt_tags}')
+    ig_hook = hook or (f'{label} {emo}' if label else 'Chat went wild')
+    ig = (f'{ig_hook} {emo}🔥\n'
+          f'{topic} Launch Day moment 😱 Aapko kaisa laga? Comment karo 👇\n'
+          f'Follow karo roz ke {topic} clips ke liye 🎮\n'
+          f'Credit: {who}\n\n'
+          f'{ig_tags}')
+    tags_list = [topic, 'GTA VI', 'GTA 6 gameplay', 'GTA 6 launch day', label or 'GTA 6 reaction', 'Shorts', 'Gaming']
+    return {'title': title, 'description': desc, 'ig': ig, 'tags': tags_list}
 
 
 def clip_markup(path, cap):
-    """Buttons under each clip: upload to YouTube (Private) and one-tap COPY of the title, description and Instagram caption."""
+    """Buttons under each clip: upload to YouTube (Private) and one-tap COPY of the title and the Instagram caption."""
     rows = []
     if YT_TOKEN.exists() and path.name not in CURRENT_STATE.get('uploaded', {}):
         rows.append([{'text': '⬆ YouTube (Private)', 'callback_data': 'yt:' + path.name}])
     rows.append([{'text': '📋 Title', 'copy_text': {'text': cap['title'][:256]}},
-                 {'text': '📋 Description', 'copy_text': {'text': cap['desc_copy'][:256]}}])
-    rows.append([{'text': '📋 Instagram caption', 'copy_text': {'text': cap['ig'][:256]}}])
+                 {'text': '📋 Instagram caption', 'copy_text': {'text': cap['ig'][:256]}}])
     return json.dumps({'inline_keyboard': rows})
 
 
@@ -731,57 +762,13 @@ def send_clip(tg, path):
         finally:
             small.unlink(missing_ok=True)
     try:
-        tg.send_all(f'YOUTUBE TITLE:\n{cap["title"]}\n\nDESCRIPTION:\n{cap["description"]}\n\nINSTAGRAM CAPTION:\n{cap["ig"]}')
+        import html as H
+        pre = lambda s: '<pre>' + H.escape(s) + '</pre>'  # Telegram: tap a code block to copy all of it
+        tg.send_all('<b>YOUTUBE TITLE</b> (tap to copy)\n' + pre(cap['title']) +
+                    '\n<b>YOUTUBE DESCRIPTION</b> (tap to copy)\n' + pre(cap['description']) +
+                    '\n<b>INSTAGRAM CAPTION</b> (tap to copy)\n' + pre(cap['ig']), html=True)
     except Exception as e:  # noqa: BLE001
         tg.send_all(f'(could not write a caption: {type(e).__name__})')
-
-
-def latest_recording():
-    recs = recordings()
-    return recs[-1] if recs else None
-
-
-def clip_now(tg, m, back):
-    """Cut the last `back` seconds of the recording that is being written right now, and let the normal sender deliver it."""
-    time.sleep(6)  # let the recording catch up a little
-    rec = latest_recording()
-    if rec is None:
-        return tg.send('No recording yet. Start one with /watch.')
-    try:
-        dur = float(subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', str(rec)],
-                                   capture_output=True, text=True, check=True).stdout.strip())
-    except Exception:  # noqa: BLE001
-        return tg.send('Could not read the recording yet. Try again in a few seconds.')
-    s = m.state['settings']
-    cmd = [sys.executable, WATCHER, '--file', str(rec), '--at', str(int(dur)), '--before', str(back), '--window', '0',
-           '--length', str(back + 5), '--model', str(s['model']), '--out', str(OUT)]
-    if not s['captions']:
-        cmd.append('--no-captions')
-    if s.get('crop'):
-        cmd.append('--crop')
-    tg.send(f'Cutting the last {back} s. It arrives in a minute or two.')
-    p = subprocess.run(cmd, capture_output=True, text=True, cwd=HERE)
-    if p.returncode != 0:
-        tg.send('Cutting failed: ' + (p.stderr or p.stdout)[-200:])
-
-
-def clear_clips(tg, hours=1):
-    """Delete finished clips (and their caption files) older than `hours`. Never touches a clip still being made."""
-    if not CLIPS.exists():
-        return tg.send('No clips folder yet.')
-    limit = time.time() - hours * 3600
-    n, freed = 0, 0
-    for p in list(CLIPS.glob('*.mp4')) + list(CLIPS.glob('*.srt')) + list((CLIPS / 'captions').glob('*.srt')):
-        if '.raw.' in p.name or '.tmp.' in p.name:
-            continue
-        try:
-            if p.stat().st_mtime < limit:
-                freed += p.stat().st_size
-                p.unlink()
-                n += 1
-        except OSError:
-            pass
-    tg.send(f'Deleted {n} old files ({freed / 1e6:.0f} MB). Clips newer than {hours} h were kept.')
 
 
 def code_version():
