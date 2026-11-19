@@ -629,7 +629,7 @@ KEYWORDS = [  # (words to look for, emoji, label shown in the title, extra hasht
     (('funny', 'lol', 'haha', 'laugh', 'joke'), '😂', 'Funny Moment', ['GTA6Funny']),
     (('wow', 'no way', 'oh my god', 'omg', 'insane', 'crazy', 'unbelievable', 'what the'), '😱', 'Reaction', ['GTA6Reaction']),
 ]
-CORE_TAGS = ['GTA6', 'Shorts', 'GTAVI', 'GrandTheftAutoVI', 'GTA6Gameplay', 'GTA6Launch', 'GTA6Release', 'ViceCity', 'Rockstar', 'Gaming']
+CORE_TAGS = ['GTAVI', 'GTA6', 'GrandTheftAutoVI', 'ViceCity', 'RockstarGames', 'GamingShorts', 'GTAEdit', 'Gaming', 'Shorts', 'GTA6Gameplay', 'GTA6Launch']
 STOP = {'it', "it's", 'the', 'a', 'an', 'and', 'but', 'so', 'no', 'i', "i'm", 'to', 'of', 'is', 'in', 'on', 'that', 'this', 'you', 'we', 'was',
         'with', 'for', 'or', 'oh', 'um', 'uh', 'he', 'she', 'they', 'me', 'my', 'at', 'be', 'are', 'do', 'if', 'what', 'just',
         'before', 'after', 'because', 'when', 'while', 'then', 'than', 'there', 'here', 'out', 'up', 'from', 'about', 'into',
@@ -700,14 +700,15 @@ def make_caption(path, state):
     pick = rng.choice(fresh[:max(6, len(specific) + 4)] if specific else fresh)
     hist.append(pick)
     del hist[:-14]
-    title = cut_words(pick.format(**D), 95)
+    base = cut_words(pick.format(**D), 80)
+    title = base if len(base) + 14 > 100 else base + ' #GTA6 #Shorts'  # hashtags in the title are clickable
     # ----- hashtags (YouTube shows the first three above the title)
     tags_all = []
-    for t in [CORE_TAGS[0], CORE_TAGS[1], CORE_TAGS[2]] + extra + [who_tag, 'GTA6Reaction', 'GTA6Hindi', 'GTA6Live'] + CORE_TAGS[3:]:
+    for t in CORE_TAGS[:3] + extra + [who_tag, 'GTA6Reaction', 'GTA6Hindi', 'GTA6Live'] + CORE_TAGS[3:]:
         if t and t not in tags_all:
             tags_all.append(t)
-    yt_tags = ' '.join('#' + t for t in tags_all[:8])
-    ig_tags = ' '.join('#' + t for t in [t for t in tags_all if t != 'Shorts'][:5]) + ' #Reels'
+    yt_tags = ' '.join('#' + t for t in tags_all[:11])  # YouTube ignores all hashtags if there are more than 15
+    ig_tags = ' '.join('#' + t for t in [t for t in tags_all if t not in ('Shorts', 'GamingShorts')][:6]) + ' #Reels'
     src = f' ({credit["url"]})' if credit.get('url') else ''
     quote = f'🎙️ Moment: "{cut_words(raw, 120)}"\n' if len(meaningful) >= 3 else ''
     what = f'{emo} {label}\n' if label else ''
@@ -716,20 +717,24 @@ def make_caption(path, state):
         f'{topic} release ke din {who} ka ye reaction viral hone laayak hai 😱 Aapka favourite moment kaunsa tha? 👇',
         f'Launch Day ka ye {topic} moment {who} ki stream par record hua 🎮🔥 Kya aap bhi yahi expect kar rahe the? Comment karo 👇',
         f'{topic} Day 1 highlights: {who} ka live reaction ek hi clip mein 😳 Pura dekho aur batao kaisa laga 👇'])
-    desc = (f'{title}\n\n{intro}\n\n'
+    about = rng.choice([
+        f'The hype for Grand Theft Auto VI is real: neon Vice City skylines, muscle cars, and Jason and Lucia taking over Leonida. Here is {who}\'s live reaction on launch day.',
+        f'GTA 6 (Grand Theft Auto VI) is finally here. Watch {who} react live as Vice City opens up: Leonida, Jason, Lucia and all the chaos.',
+        f'Day 1 of Grand Theft Auto VI: a live moment from {who}\'s stream, with Vice City, Leonida and the biggest game launch of the year.'])
+    desc = (f'{base}\n\n{intro}\n\n{about}\n\n'
             f'{what}{quote}'
             f'👍 Like karo • 🔔 Subscribe karo roz ke {topic} clips aur reactions ke liye • 💬 Apna reaction comment me likho\n\n'
             f'🎬 Source: {who}{src}\n'
             f'Not affiliated with Rockstar Games or Take-Two. Fan clip: bolo toh turant hata dunga, DM karo.\n\n'
             f'{yt_tags}')
-    ig = (f'{title}\n'
+    ig = (f'{base}\n'
           f'{topic} Launch Day moment 😱 Aapko kaisa laga? Comment karo 👇\n'
           f'Follow karo roz ke {topic} clips ke liye 🎮\n'
           f'Credit: {who}\n\n'
           f'{ig_tags}')
     cand = [topic, 'GTA VI', 'GTA 6 gameplay', 'GTA 6 launch day', 'GTA 6 day 1', 'GTA 6 reaction', 'GTA 6 live', 'GTA 6 hindi',
-            f'{who} GTA 6', f'{who} reaction', who, label, 'Grand Theft Auto VI', 'Vice City', 'Rockstar Games', 'GTA 6 funny moments',
-            'Shorts', 'Gaming']
+            f'{who} GTA 6', f'{who} reaction', who, label, 'Grand Theft Auto VI', 'Vice City', 'Leonida', 'Jason and Lucia', 'Rockstar Games',
+            'GTA Edit', 'GTA 6 funny moments', 'Gaming Shorts', 'Shorts', 'Gaming']
     tags_list, total = [], 0
     for t in cand:  # YouTube allows about 500 characters of tags in total
         if t and t not in tags_list and total + len(t) + 1 <= 450:
