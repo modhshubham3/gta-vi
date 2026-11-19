@@ -666,42 +666,75 @@ def make_caption(path, state):
             emo, label, extra = e, lab, tags
             break
     e2 = '🔥' if emo == '😱' else '😱'
-    # ----- title: hook + emojis + what it is + launch day angle
+    # ----- who / what triggered it: the parts that make each title different even when there is no usable transcript
+    credit = state.get('credit') or {}
+    who = (credit.get('author') or '').strip() or 'Streamer'
+    who_tag = re.sub(r'\W', '', who)
+    trig = spike_ratio(path)
+    kind = trig[0] if trig else None
+    D = {'who': who, 'topic': topic, 'tag': tag, 'label': label, 'emo': emo, 'e2': e2, 'hook': hook}
+    specific = []
     if hook and label:
-        opts = [f'{hook} {emo}{e2} | GTA 6 {label}', f'GTA 6 Day 1: {label} {emo} {hook}', f'{hook}?! {emo}{e2} {topic} Launch Day']
+        specific += ['{hook} {emo}{e2} | {topic} {label}', '{topic} Day 1: {label} {emo} {hook}', '{hook}?! {emo}{e2} {who} x {topic}']
     elif hook:
-        opts = [f'{hook} 😱🔥 | {topic} Launch Day', f'{topic} Day 1 😱 {hook}', f'{hook}?! 🤯 {topic}']
-    elif label:
-        opts = [f'{topic} {label} {emo}{e2} Launch Day Moment', f'Ye {topic} {label} dekha? {emo}{e2}', f'{topic} Day 1: {label} {emo} Crazy!']
-    else:
-        opts = [f'{topic} Launch Day pe chat ka reaction 😱🔥', f'Chat went wild 🔥 {topic} Day 1 moment 😱', f'{topic} Launch Day: dekho kya hua 😳🔥']
-    title = cut_words(rng.choice(opts), 95)
+        specific += ['{hook} 😱🔥 | {who} {topic}', '{topic} Day 1 😱 {hook}', '{who}: "{hook}" 🤯 {topic}']
+    if label:
+        specific += ['{label} ka ye scene dekha? {emo}{e2} {topic} | {who}', '{topic} {label}: {who} ka reaction {emo}',
+                     '{who} ne {topic} mein {label} kiya {emo}{e2}', '{topic}: {label} {emo} Aise bhi hota hai?!']
+    by_kind = {
+        'audio': ['{who} chilla utha! 🔊😱 {topic}', 'Awaaz suno {who} ki 🔊🔥 {topic} Day 1',
+                  '{topic} mein aisa kya dikha ki {who} chilla pada? 😱', 'Itna loud reaction? 🔊 {who} x {topic}'],
+        'chat': ['Live chat ek saath pagal ho gayi 🔥 {topic} | {who}', 'Chat explode ho gaya 💥 {topic} Day 1',
+                 '{who} ki stream mein chat ne tod diya 😱🔥'],
+    }
+    generic = ['{who} ka reaction dekh ke hasi nahi rukegi 😂🔥 {topic}', '{topic} Day 1: {who} ka pehla reaction 😱',
+               'Ye {topic} moment dekh ke {who} bhi hil gaya 🤯', '{who} ne {topic} mein ye kya kar diya?! 😳🔥',
+               '{topic} Launch Day pe {who} ka sabse crazy moment 🔥', 'Isko kehte hain {topic} ka asli hype 🔥😱 | {who}',
+               '{who} ki aankhon ke saamne ye ho gaya 😱 {topic}', '{topic} release hote hi ye hua 😳 | {who} live',
+               '{who} ka {topic} pe live reaction 😂', '{topic} Day 1 ka sabse unexpected moment 🤯',
+               'Kisne socha tha {topic} mein ye hoga? 😱🔥', '{who} bhi shock: {topic} ka ye scene 😮',
+               '{topic} live: ye moment miss mat karna 🔥👀', '{who} ka priceless reaction 😭🔥 {topic}']
+    pool = specific + by_kind.get(kind, []) + generic
+    hist = state.setdefault('title_hist', [])
+    fresh = [t for t in pool if t not in hist] or pool  # do not reuse a recent wording: repeats look like spam
+    pick = rng.choice(fresh[:max(6, len(specific) + 4)] if specific else fresh)
+    hist.append(pick)
+    del hist[:-14]
+    title = cut_words(pick.format(**D), 95)
     # ----- hashtags (YouTube shows the first three above the title)
     tags_all = []
-    for t in [CORE_TAGS[0], CORE_TAGS[1], CORE_TAGS[2]] + extra + CORE_TAGS[3:]:
-        if t not in tags_all:
+    for t in [CORE_TAGS[0], CORE_TAGS[1], CORE_TAGS[2]] + extra + [who_tag, 'GTA6Reaction', 'GTA6Hindi', 'GTA6Live'] + CORE_TAGS[3:]:
+        if t and t not in tags_all:
             tags_all.append(t)
-    yt_tags = ' '.join('#' + t for t in tags_all[:7])
-    ig_tags = ' '.join('#' + t for t in [t for t in tags_all if t != 'Shorts'][:4]) + ' #Reels'
-    credit = state.get('credit') or {}
-    who = credit.get('author') or '(add the streamer name)'
+    yt_tags = ' '.join('#' + t for t in tags_all[:8])
+    ig_tags = ' '.join('#' + t for t in [t for t in tags_all if t != 'Shorts'][:5]) + ' #Reels'
     src = f' ({credit["url"]})' if credit.get('url') else ''
     quote = f'🎙️ Moment: "{cut_words(raw, 120)}"\n' if len(meaningful) >= 3 else ''
     what = f'{emo} {label}\n' if label else ''
-    desc = (f'{title}\n\n'
-            f'{topic} Launch Day ka ek aur crazy moment! 🔥😱 Aapko kaisa laga? Comment karke batao 👇\n\n'
+    intro = rng.choice([
+        f'{who} ki live stream se {topic} Launch Day ka ek aur crazy moment! 🔥😱 Aapko kaisa laga? Comment karke batao 👇',
+        f'{topic} release ke din {who} ka ye reaction viral hone laayak hai 😱 Aapka favourite moment kaunsa tha? 👇',
+        f'Launch Day ka ye {topic} moment {who} ki stream par record hua 🎮🔥 Kya aap bhi yahi expect kar rahe the? Comment karo 👇',
+        f'{topic} Day 1 highlights: {who} ka live reaction ek hi clip mein 😳 Pura dekho aur batao kaisa laga 👇'])
+    desc = (f'{title}\n\n{intro}\n\n'
             f'{what}{quote}'
             f'👍 Like karo • 🔔 Subscribe karo roz ke {topic} clips aur reactions ke liye • 💬 Apna reaction comment me likho\n\n'
             f'🎬 Source: {who}{src}\n'
             f'Not affiliated with Rockstar Games or Take-Two. Fan clip: bolo toh turant hata dunga, DM karo.\n\n'
             f'{yt_tags}')
-    ig_hook = hook or label or 'Chat went wild'
-    ig = (f'{ig_hook} {emo}{e2}\n'
+    ig = (f'{title}\n'
           f'{topic} Launch Day moment 😱 Aapko kaisa laga? Comment karo 👇\n'
           f'Follow karo roz ke {topic} clips ke liye 🎮\n'
           f'Credit: {who}\n\n'
           f'{ig_tags}')
-    tags_list = [topic, 'GTA VI', 'GTA 6 gameplay', 'GTA 6 launch day', label or 'GTA 6 reaction', 'Shorts', 'Gaming']
+    cand = [topic, 'GTA VI', 'GTA 6 gameplay', 'GTA 6 launch day', 'GTA 6 day 1', 'GTA 6 reaction', 'GTA 6 live', 'GTA 6 hindi',
+            f'{who} GTA 6', f'{who} reaction', who, label, 'Grand Theft Auto VI', 'Vice City', 'Rockstar Games', 'GTA 6 funny moments',
+            'Shorts', 'Gaming']
+    tags_list, total = [], 0
+    for t in cand:  # YouTube allows about 500 characters of tags in total
+        if t and t not in tags_list and total + len(t) + 1 <= 450:
+            tags_list.append(t)
+            total += len(t) + 1
     q = f'{label} ka ye scene aapko kaisa laga? 1 se 10 rating do 👇🔥' if label else f'{topic} Launch Day ka ye moment aapko kaisa laga? Comment karo 👇🔥'
     comment = f'{q}\nRoz ke {topic} clips ke liye follow/subscribe karo 🎮'
     replies = ['Thanks bhai 🔥 aur clips ke liye follow karo!', 'Agla clip isse bhi crazy hoga, bane raho 😎', 'Source stream ka link description me hai 🎮 Credit unhi ko']
