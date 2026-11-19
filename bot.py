@@ -44,9 +44,9 @@ BACKUP = HERE / 'backup'
 TG_LIMIT = 48 * 1024 * 1024  # Telegram bots can upload up to 50 MB
 
 DEFAULTS = {'ratio': 2.5, 'min_msgs': 20, 'window': 10.0, 'quality': '720p60', 'model': 'tiny',
-            'api_poll': 10.0, 'gap': 60.0, 'length': 30.0, 'before': 15.0, 'captions': True, 'verbose': True, 'topic': 'GTA_6', 'crop': False, 'audio': True, 'audio_db': 7.0}
+            'api_poll': 10.0, 'gap': 60.0, 'length': 30.0, 'before': 15.0, 'captions': True, 'verbose': True, 'topic': 'GTA_6', 'crop': False, 'audio': True, 'audio_db': 7.0, 'best_of': 60, 'min_score': 8}
 KINDS = {'ratio': float, 'min_msgs': int, 'window': float, 'quality': str, 'model': str,
-         'api_poll': float, 'gap': float, 'length': float, 'before': float, 'captions': bool, 'verbose': bool, 'topic': str, 'crop': bool, 'audio': bool, 'audio_db': float}
+         'api_poll': float, 'gap': float, 'length': float, 'before': float, 'captions': bool, 'verbose': bool, 'topic': str, 'crop': bool, 'audio': bool, 'audio_db': float, 'best_of': int, 'min_score': int}
 FLAGS = {'ratio': '--ratio', 'min_msgs': '--min-msgs', 'window': '--window', 'quality': '--quality',
          'model': '--model', 'api_poll': '--api-poll', 'gap': '--gap', 'length': '--length', 'before': '--before', 'audio_db': '--audio-db'}
 
@@ -421,7 +421,7 @@ HELP = '''/watch LINK   start (YouTube live link or Twitch channel name/link)
 /status   what is happening now
 /clips [n]   send the last n clips (default 1)
 /disk   free disk space
-/clean   delete finished recordings to free space\n/clearclips [hours]   delete old clips (default: older than 1 hour)
+/clean   delete finished recordings to free space\n/best   send the best waiting clip now\n/clearclips [hours]   delete old clips (default: older than 1 hour)
 Tap the ⬆ button under a clip to upload it to YouTube as Private (owner and admins)
 /settings   show settings
 /set NAME VALUE   change a setting (audio_db = how loud a moment must be; audio off = chat only)
@@ -547,6 +547,9 @@ def handle(m, tg, text, role='owner'):
         tg.send(f'Deleted {len(recs)} recordings, freed {freed / 1e9:.2f} GB. Free now: {free_gb():.1f} GB')
     elif cmd == '/clearclips':
         clear_clips(tg, int(args[0]) if args and args[0].isdigit() else 1)
+    elif cmd == '/best':
+        if not send_best(tg, CURRENT_STATE, ' (sent now)'):
+            tg.send('No strong clip is waiting right now.')
     elif cmd == '/clips':
         n = min(int(args[0]), 5) if args and args[0].isdigit() else 1
         files = sorted(CLIPS.glob('*.mp4'), key=lambda p: p.stat().st_mtime)[-n:] if CLIPS.exists() else []
@@ -777,9 +780,9 @@ def spike_ratio(path):
     return None
 
 
-def score_clip(path, info, cap):
-    """1-10 and a plain-words verdict, so you can decide in two seconds."""
-    sc, why = 5, []
+def score_clip(path, info, cap=None):
+    """1-10 and a plain-words verdict, so you can decide in two seconds. (cap is kept only for old callers.)"""
+    sc, why = 6, []
     trig = spike_ratio(path)
     if trig and trig[0] == 'audio':
         sc += 2 if trig[1] >= 12 else 1
@@ -790,15 +793,9 @@ def score_clip(path, info, cap):
     else:
         sc += 1
         why.append('picked by you')
-    transcript = read_transcript(path)
-    if len(transcript.split()) >= 6:
+    if len(read_transcript(path).split()) >= 6:
         sc += 1
         why.append('clear speech')
-    else:
-        sc -= 1
-        why.append('little speech')
-    if cap.get('title') and not any(w in cap['title'] for w in ('chat ka reaction', 'Chat went wild')):
-        sc += 1
     if info.get('black', 0) > 0.3:
         sc -= 3
         why.append('mostly dark')
@@ -806,7 +803,7 @@ def score_clip(path, info, cap):
         sc -= 2
         why.append('no sound')
     sc = max(1, min(10, sc))
-    verdict = 'POST NOW 🔥' if sc >= 7 else ('okay, post if nothing better' if sc >= 5 else 'skip it, weak')
+    verdict = 'POST NOW 🔥' if sc >= 8 else ('okay, post if nothing better' if sc >= 6 else 'skip it, weak')
     return sc, f'{verdict} ({", ".join(why)})'
 
 
@@ -1084,32 +1081,85 @@ def do_rollback(tg, m):
     restart_after_change(tg, m, list(files))
 
 
+POOL = []          # [(rank, path, info)] strong clips waiting for the next "best clip" slot
+POOLED = set()     # names already in POOL
+SENT = set()
+LAST_BEST = [0.0]  # when the last clip was sent
+TRIES = {}
+
+
+def clip_rank(path, info):
+    """(score, strength): strength breaks ties, a bigger spike wins."""
+    trig = spike_ratio(path)
+    strength = (trig[1] / 4.0 if trig[0] == 'audio' else trig[1]) if trig else 0.0
+    return (score_clip(path, info)[0], strength)
+
+
+def mark_sent(state, *names):
+    SENT.update(names)
+    state['sent'] = sorted(SENT)
+    save_state(state)
+
+
+def send_best(tg, state, why=''):
+    """Send the strongest waiting clip, hold the rest back. Returns True when something was sent."""
+    if not POOL:
+        return False
+    POOL.sort(key=lambda x: x[0], reverse=True)
+    rank, p, info = POOL[0]
+    if send_clip(tg, p, info) is False:
+        TRIES[p.name] = TRIES.get(p.name, 0) + 1
+        if TRIES[p.name] < 3:
+            return False  # try again in a few seconds
+    others = len(POOL) - 1
+    names = [x[1].name for x in POOL]
+    POOL.clear()
+    POOLED.difference_update(names)
+    mark_sent(state, *names)
+    LAST_BEST[0] = time.time()
+    if others:
+        tg.send(f'🏆 Best clip{why}: score {rank[0]}/10. {others} weaker clip(s) held back (still in output/clips; /clips sends the latest).')
+    return True
+
+
 def clip_sender(tg, state):
-    """Send each new finished clip. A clip counts as finished when it has not changed for 10 s."""
-    sent = set(state.get('sent') or [])
-    tries = {}
+    """Send finished clips. By default only strong clips (score >= min_score) and only the BEST one per `best_of` minutes."""
     if 'sent' not in state:  # first run: do not flood the phone with old test clips
-        sent = {p.name for p in CLIPS.glob('*.mp4')} if CLIPS.exists() else set()
-        state['sent'] = sorted(sent)
+        state['sent'] = sorted(p.name for p in CLIPS.glob('*.mp4')) if CLIPS.exists() else []
         save_state(state)
+    SENT.update(state.get('sent') or [])
+    held = 0
     while True:
         time.sleep(5)
+        cfg = state.get('settings') or {}
+        best_of = int(cfg.get('best_of', DEFAULTS['best_of']))
+        min_score = int(cfg.get('min_score', DEFAULTS['min_score']))
         if not CLIPS.exists():
             continue
         for p in sorted(CLIPS.glob('*.mp4'), key=lambda p: p.stat().st_mtime):
-            if p.name in sent or '.raw.' in p.name or '.tmp.' in p.name or time.time() - p.stat().st_mtime < 10:
+            if p.name in SENT or p.name in POOLED or '.raw.' in p.name or '.tmp.' in p.name or time.time() - p.stat().st_mtime < 10:
                 continue
             info = clip_quality(p)
             if info['black'] > 0.6:
                 tg.send(f'Skipped {p.name}: it is mostly black. (/clips can still send it.)')
-            else:
+                mark_sent(state, p.name)
+                continue
+            rank = clip_rank(p, info)
+            if rank[0] < min_score:  # not exciting enough: keep it on disk, do not bother the phone
+                held += 1
+                mark_sent(state, p.name)
+                continue
+            if best_of <= 0:  # old behaviour: every strong clip
                 if send_clip(tg, p, info) is False:
-                    tries[p.name] = tries.get(p.name, 0) + 1
-                    if tries[p.name] < 3:
-                        continue  # try again in a few seconds
-            sent.add(p.name)
-            state['sent'] = sorted(sent)
-            save_state(state)
+                    TRIES[p.name] = TRIES.get(p.name, 0) + 1
+                    if TRIES[p.name] < 3:
+                        continue
+                mark_sent(state, p.name)
+            else:
+                POOL.append((rank, p, info))
+                POOLED.add(p.name)
+        if POOL and best_of > 0 and time.time() - LAST_BEST[0] >= best_of * 60:
+            send_best(tg, state, f' of the last {best_of} min')
 
 
 def heartbeat(tg, m):

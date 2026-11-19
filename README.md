@@ -124,3 +124,8 @@ On a very busy chat the API-based counter saturates (the message count stays fla
 Big chats saturate the chat counter, so the watcher also listens to the stream loudness. A jump of `audio_db` dB over the recent
 normal level cuts a clip. Tune with `/set audio_db 7` (lower = more clips), `/set audio off` to disable.
 Non-English speech (Hindi) is not captioned by Whisper-tiny: the clip gets only the on-screen credit and no spoken quote in the text.
+
+## Quality mode: best clip per hour
+By default the bot now sends only clips with score >= `min_score` (8) and only the best one every `best_of` minutes (60).
+Weaker clips stay in `output/clips` and are not sent. `/best` sends the strongest waiting clip right now.
+`/set best_of 0` = send every strong clip, `/set best_of 30` = best clip every 30 minutes, `/set min_score 7` = looser.
